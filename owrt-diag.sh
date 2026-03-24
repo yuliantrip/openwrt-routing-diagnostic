@@ -1,17 +1,41 @@
 #!/bin/sh
-# owrt-diag.sh - read-only OpenWRT diagnostic collector for Clash/Mihomo + Tailscale scenarios
+# owrt-diag.sh - OpenWRT diagnostic collector (manual + auto Clash state workflow)
 
 set -u
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.3.0"
+
+# =========================
+# Default settings (editable)
+# =========================
 OUT_BASE_DEFAULT="/tmp/owrt-diagnostic"
+SSCLASH_DIR_DEFAULT="/opt/clash/bin"
+
 MIN_FREE_KB_HARD="8192"
 MIN_FREE_KB_SOFT="32768"
-MODE=""
+CMD_TIMEOUT_SEC="15"
+SERVICE_WAIT_MAX_SEC="20"
+LOG_TAIL_NORMAL="800"
+LOG_TAIL_DEGRADED="200"
+DNS_TAIL_LINES="300"
+
+ANON_PRIVATE_PREFIX="55.55"   # private/CGNAT => 55.55.<oct3>.<oct4>
+ANON_PUBLIC_PREFIX="198.18"   # public IP deterministic pool
+ANON_MASK_IPV6=1
+ANON_MASK_UUID=1
+ANON_MASK_USERPASS=1
+ANON_MASK_MAC_PARTIAL=1
+
+# Runtime variables
 OUT_BASE="$OUT_BASE_DEFAULT"
 NO_ANON=0
 SESSION_ID=""
 HOSTNAME_SHORT="$(hostname 2>/dev/null || echo unknown)"
+SSCLASH_DIR="$SSCLASH_DIR_DEFAULT"
+SSCLASH_FILE=""
+AUTO_MODE=0
+REQUESTED_CLASH=""  # on|off
+MODE=""
 
 STATUS_OK=0
 STATUS_WARN=0
@@ -21,14 +45,28 @@ DEGRADED=0
 usage() {
   cat <<USAGE
 Usage:
-  $0 --mode Clash_ON|Clash_OFF [--out /tmp/owrt-diagnostic] [--no-anon]
+  $0 [--clash on|off] [--auto] [--out $OUT_BASE_DEFAULT] [--ssclash-dir $SSCLASH_DIR_DEFAULT] [--ssclash-file /path/to/clash-rules.sh] [--no-anon]
 
 Options:
-  --mode      Required. Clash_ON or Clash_OFF.
-  --out       Output base directory (default: $OUT_BASE_DEFAULT)
-  --no-anon   Skip anonymized copies (raw data only)
-  -h|--help   Show help
+  --clash         Manual target mode: on/off
+  --auto          Automatic two-state workflow with service start/stop and restore initial state
+  --out           Output base directory (default: $OUT_BASE_DEFAULT)
+  --ssclash-dir   Directory with clash-rules scripts (default: $SSCLASH_DIR_DEFAULT)
+  --ssclash-file  Exact path to clash-rules script (overrides --ssclash-dir)
+  --no-anon       Skip anonymized copies (raw only)
+  -h|--help       Show help
+
+Defaults without parameters:
+  - Detects current clash service state and runs one diagnostic snapshot for detected state.
 USAGE
+}
+
+say() {
+  level="$1"; shift
+  ts="$(date -Iseconds 2>/dev/null || date)"
+  msg="[$ts] [$level] $*"
+  echo "$msg"
+  [ -n "${RUN_LOG:-}" ] && echo "$msg" >> "$RUN_LOG"
 }
 
 log_event() {
@@ -41,6 +79,7 @@ record_error() {
   ts="$(date -Iseconds 2>/dev/null || date)"
   echo "[$ts] [$sec] [$code] $msg" >> "$ERRORS_LOG"
   STATUS_FAIL=$((STATUS_FAIL + 1))
+  say "ERROR" "$sec: $code: $msg"
 }
 
 record_warn() {
@@ -48,6 +87,7 @@ record_warn() {
   ts="$(date -Iseconds 2>/dev/null || date)"
   echo "[$ts] [$sec] [WARN] $msg" >> "$ERRORS_LOG"
   STATUS_WARN=$((STATUS_WARN + 1))
+  say "WARN" "$sec: $msg"
 }
 
 append_matrix() {
@@ -57,8 +97,7 @@ append_matrix() {
 }
 
 init_log_file() {
-  f="$1"
-  section="$2"
+  f="$1"; section="$2"
   ts="$(date -Iseconds 2>/dev/null || date)"
   {
     echo "### owrt-diag section"
@@ -74,44 +113,102 @@ init_log_file() {
 
 mask_sensitive_data() {
   in="$1"; out="$2"
-  sed -E \
-    -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/[IP_REDACTED]/g' \
-    -e 's/([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}/[IPV6_REDACTED]/g' \
-    -e 's/([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}/[MAC_REDACTED]/g' \
-    -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[UUID_REDACTED]/g' \
-    -e 's/(password|passwd|secret|token|apikey|api_key)[[:space:]]*[:=][[:space:]]*[^[:space:]]+/\1=[SECRET_REDACTED]/Ig' \
-    "$in" > "$out" 2>/dev/null || return 1
+  awk -v priv_pref="$ANON_PRIVATE_PREFIX" -v pub_pref="$ANON_PUBLIC_PREFIX" \
+      -v mask_ipv6="$ANON_MASK_IPV6" -v mask_uuid="$ANON_MASK_UUID" \
+      -v mask_userpass="$ANON_MASK_USERPASS" -v mask_mac_partial="$ANON_MASK_MAC_PARTIAL" '
+    function is_private(a,b,c,d) {
+      if (a==127) return 2;                   # loopback, keep as-is
+      if (a==10) return 1;
+      if (a==192 && b==168) return 1;
+      if (a==172 && b>=16 && b<=31) return 1;
+      if (a==100 && b>=64 && b<=127) return 1; # CGNAT/Tailscale-like
+      return 0;
+    }
+    function map_ipv4(ip,    a,b,c,d,kind,p1,p2) {
+      split(ip,o,"."); a=o[1]+0; b=o[2]+0; c=o[3]+0; d=o[4]+0;
+      kind=is_private(a,b,c,d);
+      if (kind==2) return ip; # loopback
+      if (kind==1) return priv_pref "." c "." d;
+      if (!(ip in pub_map)) {
+        pub_count++;
+        p1=pub_pref; split(p1,pp,".");
+        pub_map[ip]=pp[1] "." pp[2] "." int((pub_count-1)/254) "." ((pub_count-1)%254+1);
+      }
+      return pub_map[ip];
+    }
+    function mask_mac(mac, m) {
+      split(mac,m,":");
+      return "XX:XX:XX:XX:" m[5] ":" m[6];
+    }
+    {
+      line=$0;
+
+      if (mask_uuid == 1)
+        gsub(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/, "[UUID_REDACTED]", line);
+      if (mask_userpass == 1) {
+        gsub(/option[ \t]+username[ \t]+'\047[^'\047]*\047/, "option username '\''[USER_REDACTED]'\''", line);
+        gsub(/option[ \t]+password[ \t]+'\047[^'\047]*\047/, "option password '\''[SECRET_REDACTED]'\''", line);
+        gsub(/option[ \t]+token[ \t]+'\047[^'\047]*\047/, "option token '\''[SECRET_REDACTED]'\''", line);
+        gsub(/(password|passwd|secret|token|apikey|api_key)[ \t]*[:=][ \t]*[^ \t"'\'';]+/, "\\1=[SECRET_REDACTED]", line);
+      }
+
+      if (mask_mac_partial == 1) {
+        rest=line; line="";
+        while (match(rest, /([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}/)) {
+          mac=substr(rest, RSTART, RLENGTH);
+          line=line substr(rest,1,RSTART-1) mask_mac(mac);
+          rest=substr(rest,RSTART+RLENGTH);
+        }
+        line=line rest;
+      }
+
+      rest=line; line="";
+      while (match(rest, /([0-9]{1,3}\.){3}[0-9]{1,3}/)) {
+        ip=substr(rest, RSTART, RLENGTH);
+        rep=map_ipv4(ip);
+        line=line substr(rest,1,RSTART-1) rep;
+        rest=substr(rest,RSTART+RLENGTH);
+      }
+      line=line rest;
+
+      if (mask_ipv6 == 1)
+        gsub(/([0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}/, "[IPV6_REDACTED]", line);
+      print line;
+    }
+  ' "$in" > "$out" 2>/dev/null || return 1
   return 0
 }
 
 run_and_capture() {
   section="$1"; outfile="$2"; shift 2
   cmd="$*"
+  tmp_out="${outfile}.stdout.tmp"
   tmp_err="${outfile}.stderr.tmp"
   ts="$(date -Iseconds 2>/dev/null || date)"
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${CMD_TIMEOUT_SEC}s" sh -c "$cmd" > "$tmp_out" 2> "$tmp_err"
+    rc=$?
+  else
+    sh -c "$cmd" > "$tmp_out" 2> "$tmp_err"
+    rc=$?
+  fi
 
   {
     echo "===== BEGIN COMMAND ====="
     echo "CMD: $cmd"
     echo "SECTION: $section"
     echo "TIME: $ts"
-    if command -v timeout >/dev/null 2>&1; then
-      timeout 15s sh -c "$cmd" > "${outfile}.stdout.tmp" 2> "$tmp_err"
-      rc=$?
-    else
-      sh -c "$cmd" > "${outfile}.stdout.tmp" 2> "$tmp_err"
-      rc=$?
-    fi
     echo "RC: $rc"
     echo "----- STDOUT -----"
-    cat "${outfile}.stdout.tmp" 2>/dev/null
+    cat "$tmp_out" 2>/dev/null
     echo "----- STDERR -----"
     cat "$tmp_err" 2>/dev/null
     echo "===== END COMMAND ====="
     echo
   } >> "$outfile"
 
-  rm -f "${outfile}.stdout.tmp" "$tmp_err"
+  rm -f "$tmp_out" "$tmp_err"
 
   if [ "$rc" -eq 0 ]; then
     append_matrix "$outfile" "$cmd" "OK" "$rc"
@@ -122,6 +219,52 @@ run_and_capture() {
   fi
 }
 
+detect_pkg_manager() {
+  if command -v apk >/dev/null 2>&1; then echo "apk"; return; fi
+  if command -v opkg >/dev/null 2>&1; then echo "opkg"; return; fi
+  echo "unknown"
+}
+
+detect_clash_state() {
+  if ! command -v service >/dev/null 2>&1; then
+    echo "unknown"
+    return
+  fi
+  out="$(service clash status 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')"
+  case "$out" in
+    *running*) echo "on" ;;
+    *inactive*|*stopped*|*not*running*) echo "off" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+set_clash_state() {
+  target="$1"
+  if ! command -v service >/dev/null 2>&1; then
+    record_warn "service" "service command unavailable, cannot set clash $target"
+    return 1
+  fi
+
+  if [ "$target" = "on" ]; then
+    say "INFO" "Starting clash service"
+    service clash start >/dev/null 2>&1 || true
+  else
+    say "INFO" "Stopping clash service"
+    service clash stop >/dev/null 2>&1 || true
+  fi
+
+  i=0
+  while [ "$i" -lt "$SERVICE_WAIT_MAX_SEC" ]; do
+    now="$(detect_clash_state)"
+    [ "$now" = "$target" ] && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+
+  record_warn "service" "failed to reach clash state=$target after timeout"
+  return 1
+}
+
 check_missing_commands() {
   missing=""
   for c in ip nft fw4 uci ubus logread sed awk grep; do
@@ -130,19 +273,7 @@ check_missing_commands() {
       echo "missing_command=$c" >> "$RECO_LOG"
     fi
   done
-  if [ -n "$missing" ]; then
-    record_warn "preflight" "missing commands:$missing"
-  fi
-}
-
-detect_pkg_manager() {
-  if command -v apk >/dev/null 2>&1; then
-    echo "apk"
-  elif command -v opkg >/dev/null 2>&1; then
-    echo "opkg"
-  else
-    echo "unknown"
-  fi
+  [ -n "$missing" ] && record_warn "preflight" "missing commands:$missing"
 }
 
 preflight_space_guard() {
@@ -151,22 +282,17 @@ preflight_space_guard() {
 
   if [ "$avail_kb" -lt "$MIN_FREE_KB_HARD" ]; then
     record_error "preflight" "E_SPACE" "available=${avail_kb}KB < hard=${MIN_FREE_KB_HARD}KB"
-    echo "ERROR: not enough space in $OUT_BASE (${avail_kb}KB)." >&2
     return 1
   fi
-
   if [ "$avail_kb" -lt "$MIN_FREE_KB_SOFT" ]; then
     DEGRADED=1
-    log_event "degraded mode enabled: low space ${avail_kb}KB"
     record_warn "preflight" "low space, degraded mode enabled (${avail_kb}KB)"
   fi
-
   return 0
 }
 
 collect_static() {
-  f="$STATIC_DIR/01_system_baseline.log"
-  init_log_file "$f" "system_baseline"
+  f="$STATIC_DIR/01_system_baseline.log"; init_log_file "$f" "system_baseline"
   run_and_capture "system" "$f" "uname -a"
   run_and_capture "system" "$f" "cat /etc/openwrt_release 2>/dev/null"
   run_and_capture "system" "$f" "cat /etc/os-release 2>/dev/null"
@@ -175,128 +301,104 @@ collect_static() {
   run_and_capture "system" "$f" "free -h"
   run_and_capture "system" "$f" "df -h"
 
-  f="$STATIC_DIR/02_packages_and_binaries.log"
-  init_log_file "$f" "packages_and_binaries"
+  f="$STATIC_DIR/02_packages_and_binaries.log"; init_log_file "$f" "packages"
   pm="$(detect_pkg_manager)"
   run_and_capture "packages" "$f" "echo package_manager=$pm"
-  if [ "$pm" = "opkg" ]; then
-    run_and_capture "packages" "$f" "opkg list-installed"
-  elif [ "$pm" = "apk" ]; then
-    run_and_capture "packages" "$f" "apk info -vv"
-  else
-    record_warn "packages" "No package manager detected"
-  fi
+  [ "$pm" = "opkg" ] && run_and_capture "packages" "$f" "opkg list-installed"
+  [ "$pm" = "apk" ] && run_and_capture "packages" "$f" "apk info -vv"
   run_and_capture "packages" "$f" "which nft ip iptables ip6tables fw4 tailscale mihomo clash logread ubus uci 2>&1"
 
-  f="$STATIC_DIR/03_kernel_modules.log"
-  init_log_file "$f" "kernel_modules"
+  f="$STATIC_DIR/03_kernel_modules.log"; init_log_file "$f" "kernel_modules"
   run_and_capture "modules" "$f" "lsmod"
   run_and_capture "modules" "$f" "modinfo nft_tproxy 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nf_tproxy_ipv4 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nf_tproxy_ipv6 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nft_socket 2>/dev/null || true"
-
-  f="$STATIC_DIR/04_uci_network_firewall_dhcp_system.log"
-  init_log_file "$f" "uci_exports"
-  run_and_capture "uci" "$f" "uci export network"
-  run_and_capture "uci" "$f" "uci export firewall"
-  run_and_capture "uci" "$f" "uci export dhcp"
-  run_and_capture "uci" "$f" "uci export system"
 }
 
-collect_mode_runtime() {
-  f="$MODE_DIR/11_interfaces_runtime.log"
-  init_log_file "$f" "interfaces_runtime"
+collect_mode_runtime_dir() {
+  mdir="$1"
+  f="$mdir/11_interfaces_runtime.log"; init_log_file "$f" "interfaces_runtime"
   run_and_capture "interfaces" "$f" "ip -br link"
   run_and_capture "interfaces" "$f" "ip -br addr"
-  run_and_capture "interfaces" "$f" "ip -d link"
   run_and_capture "interfaces" "$f" "ip link show clash-tun 2>&1"
-  run_and_capture "interfaces" "$f" "ubus call network.interface dump 2>/dev/null"
 
-  f="$MODE_DIR/12_routing_runtime.log"
-  init_log_file "$f" "routing_runtime"
-  run_and_capture "routing" "$f" "ip route show table main"
+  f="$mdir/12_routing_runtime.log"; init_log_file "$f" "routing_runtime"
   run_and_capture "routing" "$f" "ip route show table all"
   run_and_capture "routing" "$f" "ip route show table 100"
   run_and_capture "routing" "$f" "ip route show table 101"
   run_and_capture "routing" "$f" "ip rule show"
-  run_and_capture "routing" "$f" "ip rule show | grep -E 'fwmark|lookup 100|lookup 101'"
-  run_and_capture "routing" "$f" "ip -6 route show table all"
-  run_and_capture "routing" "$f" "ip -6 rule show"
 
-  f="$MODE_DIR/13_fw4_nft_runtime.log"
-  init_log_file "$f" "fw4_nft_runtime"
+  f="$mdir/13_fw4_nft_runtime.log"; init_log_file "$f" "fw4_nft_runtime"
   run_and_capture "firewall" "$f" "fw4 print"
-  run_and_capture "firewall" "$f" "nft list tables"
   run_and_capture "firewall" "$f" "nft list ruleset"
-  run_and_capture "firewall" "$f" "nft -a list ruleset"
   run_and_capture "firewall" "$f" "nft list ruleset | grep -Ei 'tproxy|mark|7894|clash|quic|443'"
 
-  f="$MODE_DIR/14_iptables_compat_audit.log"
-  init_log_file "$f" "iptables_compat"
-  run_and_capture "iptables" "$f" "iptables -V 2>&1"
-  run_and_capture "iptables" "$f" "ip6tables -V 2>&1"
+  f="$mdir/14_iptables_compat_audit.log"; init_log_file "$f" "iptables_compat"
   run_and_capture "iptables" "$f" "iptables -t mangle -S 2>&1"
-  run_and_capture "iptables" "$f" "iptables -t filter -S 2>&1"
-  run_and_capture "iptables" "$f" "iptables-save -t mangle 2>&1"
   run_and_capture "iptables" "$f" "iptables-save 2>&1"
-  run_and_capture "iptables" "$f" "ip6tables-save 2>&1"
 
-  f="$MODE_DIR/15_dns_runtime.log"
-  init_log_file "$f" "dns_runtime"
-  run_and_capture "dns" "$f" "cat /tmp/resolv.conf 2>/dev/null"
+  f="$mdir/15_dns_runtime.log"; init_log_file "$f" "dns_runtime"
   run_and_capture "dns" "$f" "cat /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null"
-  run_and_capture "dns" "$f" "uci export dhcp"
-  run_and_capture "dns" "$f" "logread | tail -n 300 | grep -Ei 'dns|resolve|dnsmasq|servfail|timeout'"
-  run_and_capture "dns" "$f" "nslookup openwrt.org 127.0.0.1 2>&1 || true"
+  run_and_capture "dns" "$f" "logread | tail -n $DNS_TAIL_LINES | grep -Ei 'dns|resolve|dnsmasq|servfail|timeout'"
 
-  f="$MODE_DIR/16_clash_tailscale_runtime.log"
-  init_log_file "$f" "clash_tailscale_runtime"
-  run_and_capture "runtime" "$f" "ps w | grep -Ei 'mihomo|clash|tailscale|tun|tproxy'"
-  run_and_capture "runtime" "$f" "ss -lntup"
+  f="$mdir/16_clash_tailscale_runtime.log"; init_log_file "$f" "clash_tailscale_runtime"
+  run_and_capture "runtime" "$f" "service clash status 2>&1 || true"
+  run_and_capture "runtime" "$f" "ps w | grep -Ei 'mihomo|clash|tailscale|tproxy'"
   run_and_capture "runtime" "$f" "ss -lntup | grep -E '7890|7891|7892|7893|7894' || true"
-  run_and_capture "runtime" "$f" "tailscale status 2>&1 || true"
-  run_and_capture "runtime" "$f" "tailscale ip -4 2>&1 || true"
 
-  f="$MODE_DIR/17_sysctl_network_runtime.log"
-  init_log_file "$f" "sysctl_runtime"
+  f="$mdir/17_sysctl_network_runtime.log"; init_log_file "$f" "sysctl_runtime"
   run_and_capture "sysctl" "$f" "sysctl net.ipv4.ip_forward"
-  run_and_capture "sysctl" "$f" "sysctl net.ipv6.conf.all.forwarding"
   run_and_capture "sysctl" "$f" "sysctl net.ipv4.conf.all.rp_filter"
-  run_and_capture "sysctl" "$f" "sysctl net.ipv4.conf.default.rp_filter"
 
-  f="$MODE_DIR/18_logs_filtered.log"
-  init_log_file "$f" "logs_filtered"
+  f="$mdir/18_logs_filtered.log"; init_log_file "$f" "logs_filtered"
   if [ "$DEGRADED" -eq 1 ]; then
-    run_and_capture "logs" "$f" "logread | tail -n 200"
+    run_and_capture "logs" "$f" "logread | tail -n $LOG_TAIL_DEGRADED"
   else
-    run_and_capture "logs" "$f" "logread | tail -n 800"
+    run_and_capture "logs" "$f" "logread | tail -n $LOG_TAIL_NORMAL"
   fi
-  run_and_capture "logs" "$f" "dmesg | tail -n 300"
-  run_and_capture "logs" "$f" "logread | grep -Ei 'nft|fw4|tproxy|tailscale|dns|drop|reject|conntrack' | tail -n 500"
 
-  f="$MODE_DIR/19_router_connectivity.log"
-  init_log_file "$f" "router_connectivity"
+  f="$mdir/19_router_connectivity.log"; init_log_file "$f" "connectivity"
   run_and_capture "connectivity" "$f" "ping -c 3 1.1.1.1"
-  run_and_capture "connectivity" "$f" "ping -c 3 8.8.8.8"
   run_and_capture "connectivity" "$f" "nslookup openwrt.org 1.1.1.1 2>&1 || true"
 
-  f="$MODE_DIR/20_ipset_runtime.log"
-  init_log_file "$f" "ipset_runtime"
+  f="$mdir/20_ipset_runtime.log"; init_log_file "$f" "ipset_runtime"
   run_and_capture "ipset" "$f" "ipset list clash_fakeip_whitelist 2>&1"
-  run_and_capture "ipset" "$f" "ipset list 2>&1"
+}
+
+collect_ssclash_touchpoints() {
+  ts="$(date -Iseconds 2>/dev/null || date)"
+  {
+    echo "### ssclash touchpoints"
+    echo "TIME: $ts"
+    echo "SSCLASH_DIR: $SSCLASH_DIR"
+    echo "SSCLASH_FILE: $SSCLASH_FILE"
+    echo
+  } > "$TOUCH_LOG"
+
+  files=""
+  if [ -n "$SSCLASH_FILE" ]; then
+    [ -f "$SSCLASH_FILE" ] && files="$SSCLASH_FILE" || record_warn "ssclash" "--ssclash-file not found: $SSCLASH_FILE"
+  elif [ -d "$SSCLASH_DIR" ]; then
+    files="$(find "$SSCLASH_DIR" -maxdepth 2 -type f \( -name 'clash-rules*' -o -name '*ssclash*' \) 2>/dev/null)"
+  fi
+
+  [ -z "$files" ] && { echo "NO_FILES_FOUND=1" >> "$TOUCH_LOG"; return 0; }
+  for f in $files; do
+    echo "===== FILE: $f =====" >> "$TOUCH_LOG"
+    grep -nE 'uci |nft |ip rule|ip route|iptables|ip6tables|sysctl|service |/etc/init\.d/' "$f" >> "$TOUCH_LOG" 2>/dev/null || true
+    grep -nE 'fwmark|0x0001|0x0002|0x0003|0xff00|table 100|table 101|clash-tun|7894|7890:7894|clash_fakeip_whitelist' "$f" >> "$TOUCH_LOG" 2>/dev/null || true
+    echo >> "$TOUCH_LOG"
+  done
 }
 
 make_anonymous_copy() {
   [ "$NO_ANON" -eq 1 ] && return 0
-  log_event "start anonymization"
   find "$RAW_ROOT" -type f | while read -r src; do
     rel="${src#$RAW_ROOT/}"
     dst="$ANON_ROOT/$rel"
     mkdir -p "$(dirname "$dst")"
-    if ! mask_sensitive_data "$src" "$dst"; then
-      record_warn "anon" "failed to anonymize $src"
-    fi
+    mask_sensitive_data "$src" "$dst" || record_warn "anon" "failed to anonymize $src"
   done
 }
 
@@ -304,9 +406,12 @@ write_manifest() {
   {
     echo "script_version=$SCRIPT_VERSION"
     echo "mode=$MODE"
+    echo "auto_mode=$AUTO_MODE"
     echo "session_id=$SESSION_ID"
     echo "hostname=$HOSTNAME_SHORT"
     echo "output_base=$OUT_BASE"
+    echo "ssclash_dir=$SSCLASH_DIR"
+    echo "ssclash_file=$SSCLASH_FILE"
     echo "degraded=$DEGRADED"
     echo "status_ok=$STATUS_OK"
     echo "status_warn=$STATUS_WARN"
@@ -320,95 +425,146 @@ write_summary() {
     echo "summary_ok=$STATUS_OK"
     echo "summary_warn=$STATUS_WARN"
     echo "summary_fail=$STATUS_FAIL"
-    if [ "$STATUS_FAIL" -gt 0 ]; then
-      echo "summary_result=FAIL"
-    elif [ "$STATUS_WARN" -gt 0 ]; then
-      echo "summary_result=WARN"
-    else
-      echo "summary_result=OK"
-    fi
+    [ "$STATUS_FAIL" -gt 0 ] && echo "summary_result=FAIL" || {
+      [ "$STATUS_WARN" -gt 0 ] && echo "summary_result=WARN" || echo "summary_result=OK"
+    }
   } > "$SUMMARY_LOG"
 }
 
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --mode)
-        MODE="${2:-}"; shift 2 ;;
-      --out)
-        OUT_BASE="${2:-}"; shift 2 ;;
-      --no-anon)
-        NO_ANON=1; shift ;;
-      -h|--help)
-        usage; exit 0 ;;
-      *)
-        echo "Unknown argument: $1" >&2
-        usage
-        exit 2 ;;
+      --clash) REQUESTED_CLASH="${2:-}"; shift 2 ;;
+      --auto) AUTO_MODE=1; shift ;;
+      --out) OUT_BASE="${2:-}"; shift 2 ;;
+      --ssclash-dir) SSCLASH_DIR="${2:-}"; shift 2 ;;
+      --ssclash-file) SSCLASH_FILE="${2:-}"; shift 2 ;;
+      --no-anon) NO_ANON=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
     esac
   done
 
-  if [ "$MODE" != "Clash_ON" ] && [ "$MODE" != "Clash_OFF" ]; then
-    echo "--mode must be Clash_ON or Clash_OFF" >&2
-    usage
+  if [ -n "$REQUESTED_CLASH" ] && [ "$REQUESTED_CLASH" != "on" ] && [ "$REQUESTED_CLASH" != "off" ]; then
+    echo "--clash must be on|off" >&2
     exit 2
   fi
 }
 
-main() {
-  parse_args "$@"
-
-  mkdir -p "$OUT_BASE" || {
-    echo "Cannot create output dir: $OUT_BASE" >&2
-    exit 2
-  }
-
+prepare_paths() {
+  mkdir -p "$OUT_BASE" || exit 2
   SESSION_ID="$(date +%Y%m%d-%H%M%S)_${HOSTNAME_SHORT}"
   ROOT_DIR="$OUT_BASE/$SESSION_ID"
   RAW_ROOT="$ROOT_DIR/raw"
   ANON_ROOT="$ROOT_DIR/anon"
   META_DIR="$ROOT_DIR/meta"
   STATIC_DIR="$RAW_ROOT/00_static"
-  if [ "$MODE" = "Clash_OFF" ]; then
-    MODE_DIR="$RAW_ROOT/10_mode_Clash_OFF"
-  else
-    MODE_DIR="$RAW_ROOT/11_mode_Clash_ON"
-  fi
-
-  mkdir -p "$STATIC_DIR" "$MODE_DIR" "$META_DIR" "$ANON_ROOT" || exit 2
+  mkdir -p "$STATIC_DIR" "$ANON_ROOT" "$META_DIR" || exit 2
 
   MANIFEST_LOG="$META_DIR/90_manifest.log"
   ERRORS_LOG="$META_DIR/91_errors.log"
   RECO_LOG="$META_DIR/92_recommendations.log"
   MATRIX_LOG="$META_DIR/93_collection_matrix.csv"
+  TOUCH_LOG="$META_DIR/94_ssclash_touchpoints.log"
   EVENTS_LOG="$META_DIR/95_runtime_events.log"
   SUMMARY_LOG="$META_DIR/96_summary.log"
+  RUN_LOG="$META_DIR/97_run_$(date +%Y%m%d-%H%M%S).log"
 
-  touch "$MANIFEST_LOG" "$ERRORS_LOG" "$RECO_LOG" "$MATRIX_LOG" "$EVENTS_LOG" "$SUMMARY_LOG" || exit 2
-  log_event "session started"
+  touch "$MANIFEST_LOG" "$ERRORS_LOG" "$RECO_LOG" "$MATRIX_LOG" "$TOUCH_LOG" "$EVENTS_LOG" "$SUMMARY_LOG" "$RUN_LOG" || exit 2
+}
 
-  if ! preflight_space_guard; then
-    write_manifest
-    write_summary
-    exit 2
+collect_for_mode_label() {
+  label="$1"; dir="$2"
+  MODE="$label"
+  mkdir -p "$dir"
+  say "INFO" "Collecting diagnostics for $label -> $dir"
+  collect_mode_runtime_dir "$dir"
+}
+
+manual_workflow() {
+  detected="$(detect_clash_state)"
+  if [ -n "$REQUESTED_CLASH" ]; then
+    if [ "$REQUESTED_CLASH" = "on" ]; then MODE="Clash_ON"; mdir="$RAW_ROOT/11_mode_Clash_ON"; else MODE="Clash_OFF"; mdir="$RAW_ROOT/10_mode_Clash_OFF"; fi
+    if [ "$detected" != "unknown" ] && [ "$detected" != "$REQUESTED_CLASH" ]; then
+      record_warn "clash_state" "manual mode=$REQUESTED_CLASH but service state=$detected"
+    fi
+  else
+    # default: auto-detect single snapshot
+    if [ "$detected" = "on" ]; then MODE="Clash_ON"; mdir="$RAW_ROOT/11_mode_Clash_ON"; else MODE="Clash_OFF"; mdir="$RAW_ROOT/10_mode_Clash_OFF"; fi
+    say "INFO" "No --clash parameter. Detected service state=$detected, selected mode=$MODE"
+  fi
+  collect_for_mode_label "$MODE" "$mdir"
+}
+
+auto_workflow() {
+  initial="$(detect_clash_state)"
+  say "INFO" "AUTO start; initial clash state=$initial"
+
+  if [ "$initial" = "on" ]; then
+    collect_for_mode_label "Clash_ON" "$RAW_ROOT/11_mode_Clash_ON"
+    set_clash_state off
+    now="$(detect_clash_state)"
+    [ "$now" != "off" ] && record_warn "auto" "clash should be off but state=$now"
+    collect_for_mode_label "Clash_OFF" "$RAW_ROOT/10_mode_Clash_OFF"
+
+    now="$(detect_clash_state)"
+    [ "$now" != "off" ] && record_warn "auto" "clash restarted unexpectedly before ON-post capture"
+    set_clash_state on
+    now="$(detect_clash_state)"
+    [ "$now" != "on" ] && record_warn "auto" "clash failed to start for ON-post capture"
+    collect_for_mode_label "Clash_ON_POST" "$RAW_ROOT/12_mode_Clash_ON_post"
+
+    set_clash_state on >/dev/null 2>&1 || true
+  else
+    # treat unknown as off-oriented path with warnings
+    [ "$initial" = "unknown" ] && record_warn "auto" "initial clash state unknown; proceeding with off->on->off sequence"
+    set_clash_state off
+    collect_for_mode_label "Clash_OFF" "$RAW_ROOT/10_mode_Clash_OFF"
+
+    set_clash_state on
+    now="$(detect_clash_state)"
+    [ "$now" != "on" ] && record_warn "auto" "clash failed to start before ON capture"
+    collect_for_mode_label "Clash_ON" "$RAW_ROOT/11_mode_Clash_ON"
+
+    now="$(detect_clash_state)"
+    [ "$now" != "on" ] && record_warn "auto" "clash unexpectedly not running after ON capture"
+    set_clash_state off
   fi
 
+  # restore to initial known state
+  if [ "$initial" = "on" ]; then
+    set_clash_state on || record_warn "auto" "failed to restore initial state: on"
+  elif [ "$initial" = "off" ]; then
+    set_clash_state off || record_warn "auto" "failed to restore initial state: off"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  prepare_paths
+  log_event "session started"
+  say "INFO" "Session directory: $ROOT_DIR"
+
+  preflight_space_guard || { write_manifest; write_summary; exit 2; }
   check_missing_commands
   collect_static
-  collect_mode_runtime
+  collect_ssclash_touchpoints
+
+  if [ "$AUTO_MODE" -eq 1 ]; then
+    auto_workflow
+  else
+    manual_workflow
+  fi
+
   make_anonymous_copy
   write_manifest
   write_summary
-
   log_event "session finished"
+  say "INFO" "Completed. Summary: ok=$STATUS_OK warn=$STATUS_WARN fail=$STATUS_FAIL"
 
-  if [ "$STATUS_FAIL" -gt 0 ]; then
-    exit 2
-  elif [ "$STATUS_WARN" -gt 0 ]; then
-    exit 1
-  else
-    exit 0
-  fi
+  if [ "$STATUS_FAIL" -gt 0 ]; then exit 2; fi
+  if [ "$STATUS_WARN" -gt 0 ]; then exit 1; fi
+  exit 0
 }
 
 main "$@"
