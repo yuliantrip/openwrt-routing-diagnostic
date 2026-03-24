@@ -232,8 +232,8 @@ detect_clash_state() {
   fi
   out="$(service clash status 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')"
   case "$out" in
+    *not*running*|*inactive*|*stopped*) echo "off" ;;
     *running*) echo "on" ;;
-    *inactive*|*stopped*|*not*running*) echo "off" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -394,12 +394,16 @@ collect_ssclash_touchpoints() {
 
 make_anonymous_copy() {
   [ "$NO_ANON" -eq 1 ] && return 0
-  find "$RAW_ROOT" -type f | while read -r src; do
+  tmp_list="${META_DIR}/.anon_filelist.$$"
+  find "$RAW_ROOT" -type f > "$tmp_list" 2>/dev/null || true
+  while read -r src; do
+    [ -n "$src" ] || continue
     rel="${src#$RAW_ROOT/}"
     dst="$ANON_ROOT/$rel"
     mkdir -p "$(dirname "$dst")"
     mask_sensitive_data "$src" "$dst" || record_warn "anon" "failed to anonymize $src"
-  done
+  done < "$tmp_list"
+  rm -f "$tmp_list"
 }
 
 write_manifest() {
