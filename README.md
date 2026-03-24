@@ -23,7 +23,9 @@ All default runtime/anonymization knobs are grouped at the top of `owrt-diag.sh`
   ├─ raw/
   │   ├─ 00_static/
   │   ├─ 10_mode_Clash_OFF/
+  │   ├─ 10_mode_Clash_OFF_untrusted/   # if auto state transition failed
   │   ├─ 11_mode_Clash_ON/
+  │   ├─ 11_mode_Clash_ON_untrusted/    # if auto state transition failed
   │   └─ 12_mode_Clash_ON_post/   # only in --auto when initial state is ON
   ├─ anon/
   └─ meta/
@@ -32,6 +34,11 @@ All default runtime/anonymization knobs are grouped at the top of `owrt-diag.sh`
 ## Usage
 
 ```bash
+# one-liner on router: download latest, make executable, run
+wget -O /tmp/owrt-diag.sh https://raw.githubusercontent.com/yuliantrip/openwrt-routing-diagnostic/main/owrt-diag.sh \
+  && chmod +x /tmp/owrt-diag.sh \
+  && /tmp/owrt-diag.sh
+
 # default run (no params): detect service clash status and run one snapshot
 ./owrt-diag.sh
 
@@ -57,6 +64,24 @@ Running `./owrt-diag.sh` without extra options uses:
 - output directory: `/tmp/owrt-diagnostic`
 - ssclash directory: `/opt/clash/bin`
 - anonymization: enabled
+
+Service wait/timeout defaults are configurable in script header:
+- `SERVICE_CMD_TIMEOUT_SEC=60`
+- `SERVICE_WAIT_MAX_SEC=60`
+- `SERVICE_WAIT_LOG_INTERVAL_SEC=1`
+
+## File naming
+
+- Session folder: `<timestamp>_<hostname>` (hostname auto-detected from `hostname` / `/proc/sys/kernel/hostname` / `uname -n` fallback).
+- Diagnostic files include hostname suffix, e.g. `01_system_baseline_<hostname>.log`.
+
+## About WARN lines in output
+
+Some WARN entries are normal and expected depending on router setup:
+- `ip link show clash-tun` fails when TUN interface is not present in current mode.
+- `ip route show table 101` fails if table 101 is not configured in this profile.
+- `iptables*` commands can fail (`rc=127`) on nftables-only systems without iptables-compat packages.
+- `ipset list clash_fakeip_whitelist` can fail when the set is absent (script still continues).
 
 ## Anonymization policy (anon/)
 

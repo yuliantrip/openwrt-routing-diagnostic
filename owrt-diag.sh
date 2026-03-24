@@ -3,28 +3,31 @@
 
 set -u
 
-SCRIPT_VERSION="0.3.4"
+SCRIPT_VERSION="0.3.5"
 
 # =========================
 # Default settings (editable)
 # =========================
-OUT_BASE_DEFAULT="/tmp/owrt-diagnostic"
-SSCLASH_DIR_DEFAULT="/opt/clash/bin"
+OUT_BASE_DEFAULT="/tmp/owrt-diagnostic"   # base output directory
+SSCLASH_DIR_DEFAULT="/opt/clash/bin"      # default path to clash-rules scripts
+CLASH_SERVICE_NAME="clash"                # init service name (clash/mihomo/etc)
 
-MIN_FREE_KB_HARD="8192"
-MIN_FREE_KB_SOFT="32768"
-CMD_TIMEOUT_SEC="15"
-SERVICE_WAIT_MAX_SEC="20"
-LOG_TAIL_NORMAL="800"
-LOG_TAIL_DEGRADED="200"
-DNS_TAIL_LINES="300"
+MIN_FREE_KB_HARD="8192"                   # hard stop threshold for free space (KB)
+MIN_FREE_KB_SOFT="32768"                  # degraded mode threshold for free space (KB)
+CMD_TIMEOUT_SEC="15"                      # timeout for diagnostic commands
+SERVICE_CMD_TIMEOUT_SEC="60"              # timeout for `service clash start/stop` command itself
+SERVICE_WAIT_MAX_SEC="60"                 # max seconds waiting until service reaches target state
+SERVICE_WAIT_LOG_INTERVAL_SEC="1"         # progress log interval while waiting service state
+LOG_TAIL_NORMAL="800"                     # log tail lines in normal mode
+LOG_TAIL_DEGRADED="200"                   # log tail lines in degraded mode
+DNS_TAIL_LINES="300"                      # dns log tail lines
 
-ANON_PRIVATE_PREFIX="55.55"   # private/CGNAT => 55.55.<oct3>.<oct4>
-ANON_PUBLIC_PREFIX="198.18"   # public IP deterministic pool
-ANON_MASK_IPV6=1
-ANON_MASK_UUID=1
-ANON_MASK_USERPASS=1
-ANON_MASK_MAC_PARTIAL=1
+ANON_PRIVATE_PREFIX="55.55"               # private/CGNAT => 55.55.<oct3>.<oct4>
+ANON_PUBLIC_PREFIX="198.18"               # public IP deterministic pool
+ANON_MASK_IPV6=1                          # 1=mask IPv6
+ANON_MASK_UUID=1                          # 1=mask UUID
+ANON_MASK_USERPASS=1                      # 1=mask usernames/passwords/tokens
+ANON_MASK_MAC_PARTIAL=1                   # 1=mask MAC partially
 
 # Runtime variables
 OUT_BASE="$OUT_BASE_DEFAULT"
@@ -59,6 +62,19 @@ Options:
 Defaults without parameters:
   - Detects current clash service state and runs one diagnostic snapshot for detected state.
 USAGE
+}
+
+detect_hostname() {
+  h="$(hostname 2>/dev/null || true)"
+  [ -z "$h" ] && h="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
+  [ -z "$h" ] && h="$(uname -n 2>/dev/null || true)"
+  [ -z "$h" ] && h="unknown"
+  printf '%s' "$h" | tr -c '[:alnum:]._-' '_' | sed 's/^_\\+//; s/_\\+$//'
+}
+
+fname() {
+  # $1 = logical base name without extension
+  echo "${1}_${HOSTNAME_SHORT}.log"
 }
 
 say() {
@@ -245,7 +261,7 @@ detect_clash_state() {
     echo "unknown"
     return
   fi
-  out="$(service clash status 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')"
+  out="$(service "$CLASH_SERVICE_NAME" status 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')"
   case "$out" in
     *not*running*|*inactive*|*stopped*) echo "off" ;;
     *running*) echo "on" ;;
@@ -262,20 +278,33 @@ set_clash_state() {
 
   if [ "$target" = "on" ]; then
     say "INFO" "Starting clash service"
-    service clash start >/dev/null 2>&1 || true
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "${SERVICE_CMD_TIMEOUT_SEC}s" service "$CLASH_SERVICE_NAME" start >/dev/null 2>&1 || true
+    else
+      service "$CLASH_SERVICE_NAME" start >/dev/null 2>&1 || true
+    fi
   else
     say "INFO" "Stopping clash service"
-    service clash stop >/dev/null 2>&1 || true
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "${SERVICE_CMD_TIMEOUT_SEC}s" service "$CLASH_SERVICE_NAME" stop >/dev/null 2>&1 || true
+    else
+      service "$CLASH_SERVICE_NAME" stop >/dev/null 2>&1 || true
+    fi
   fi
 
+  [ "$SERVICE_WAIT_LOG_INTERVAL_SEC" -le 0 ] && SERVICE_WAIT_LOG_INTERVAL_SEC=1
   i=0
   while [ "$i" -lt "$SERVICE_WAIT_MAX_SEC" ]; do
     now="$(detect_clash_state)"
     [ "$now" = "$target" ] && return 0
+    if [ $((i % SERVICE_WAIT_LOG_INTERVAL_SEC)) -eq 0 ]; then
+      say "INFO" "Waiting for clash=$target ... ${i}/${SERVICE_WAIT_MAX_SEC}s (current=$now)"
+    fi
     sleep 1
     i=$((i + 1))
   done
 
+  say "WARN" "Timeout after ${SERVICE_WAIT_MAX_SEC}s waiting clash=$target"
   record_warn "service" "failed to reach clash state=$target after timeout"
   return 1
 }
@@ -307,7 +336,7 @@ preflight_space_guard() {
 }
 
 collect_static() {
-  f="$STATIC_DIR/01_system_baseline.log"; init_log_file "$f" "system_baseline"
+  f="$STATIC_DIR/$(fname 01_system_baseline)"; init_log_file "$f" "system_baseline"
   run_and_capture "system" "$f" "uname -a"
   run_and_capture "system" "$f" "cat /etc/openwrt_release 2>/dev/null"
   run_and_capture "system" "$f" "cat /etc/os-release 2>/dev/null"
@@ -316,14 +345,14 @@ collect_static() {
   run_and_capture "system" "$f" "free -h"
   run_and_capture "system" "$f" "df -h"
 
-  f="$STATIC_DIR/02_packages_and_binaries.log"; init_log_file "$f" "packages"
+  f="$STATIC_DIR/$(fname 02_packages_and_binaries)"; init_log_file "$f" "packages"
   pm="$(detect_pkg_manager)"
   run_and_capture "packages" "$f" "echo package_manager=$pm"
   [ "$pm" = "opkg" ] && run_and_capture "packages" "$f" "opkg list-installed"
   [ "$pm" = "apk" ] && run_and_capture "packages" "$f" "apk info -vv"
-  run_and_capture "packages" "$f" "which nft ip iptables ip6tables fw4 tailscale mihomo clash logread ubus uci 2>&1"
+  run_and_capture "packages" "$f" "for b in nft ip iptables ip6tables fw4 tailscale mihomo clash logread ubus uci; do command -v \$b >/dev/null 2>&1 && echo \"\$b=ok\" || echo \"\$b=missing\"; done"
 
-  f="$STATIC_DIR/03_kernel_modules.log"; init_log_file "$f" "kernel_modules"
+  f="$STATIC_DIR/$(fname 03_kernel_modules)"; init_log_file "$f" "kernel_modules"
   run_and_capture "modules" "$f" "lsmod"
   run_and_capture "modules" "$f" "modinfo nft_tproxy 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nf_tproxy_ipv4 2>/dev/null || true"
@@ -333,52 +362,52 @@ collect_static() {
 
 collect_mode_runtime_dir() {
   mdir="$1"
-  f="$mdir/11_interfaces_runtime.log"; init_log_file "$f" "interfaces_runtime"
+  f="$mdir/$(fname 11_interfaces_runtime)"; init_log_file "$f" "interfaces_runtime"
   run_and_capture "interfaces" "$f" "ip -br link"
   run_and_capture "interfaces" "$f" "ip -br addr"
   run_and_capture "interfaces" "$f" "ip link show clash-tun 2>&1"
 
-  f="$mdir/12_routing_runtime.log"; init_log_file "$f" "routing_runtime"
+  f="$mdir/$(fname 12_routing_runtime)"; init_log_file "$f" "routing_runtime"
   run_and_capture "routing" "$f" "ip route show table all"
   run_and_capture "routing" "$f" "ip route show table 100"
   run_and_capture "routing" "$f" "ip route show table 101"
   run_and_capture "routing" "$f" "ip rule show"
 
-  f="$mdir/13_fw4_nft_runtime.log"; init_log_file "$f" "fw4_nft_runtime"
+  f="$mdir/$(fname 13_fw4_nft_runtime)"; init_log_file "$f" "fw4_nft_runtime"
   run_and_capture "firewall" "$f" "fw4 print"
   run_and_capture "firewall" "$f" "nft list ruleset"
   run_and_capture "firewall" "$f" "nft list ruleset | grep -Ei 'tproxy|mark|7894|clash|quic|443'"
 
-  f="$mdir/14_iptables_compat_audit.log"; init_log_file "$f" "iptables_compat"
+  f="$mdir/$(fname 14_iptables_compat_audit)"; init_log_file "$f" "iptables_compat"
   run_and_capture "iptables" "$f" "iptables -t mangle -S 2>&1"
   run_and_capture "iptables" "$f" "iptables-save 2>&1"
 
-  f="$mdir/15_dns_runtime.log"; init_log_file "$f" "dns_runtime"
+  f="$mdir/$(fname 15_dns_runtime)"; init_log_file "$f" "dns_runtime"
   run_and_capture "dns" "$f" "cat /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null"
   run_and_capture "dns" "$f" "logread | tail -n $DNS_TAIL_LINES | grep -Ei 'dns|resolve|dnsmasq|servfail|timeout'"
 
-  f="$mdir/16_clash_tailscale_runtime.log"; init_log_file "$f" "clash_tailscale_runtime"
-  run_and_capture "runtime" "$f" "service clash status 2>&1 || true"
-  run_and_capture "runtime" "$f" "ps w | grep -Ei '[m]ihomo|[c]lash|[t]ailscale|[t]proxy'"
+  f="$mdir/$(fname 16_clash_tailscale_runtime)"; init_log_file "$f" "clash_tailscale_runtime"
+  run_and_capture "runtime" "$f" "service \"$CLASH_SERVICE_NAME\" status 2>&1 || true"
+  run_and_capture "runtime" "$f" "ps w | grep -Ei '[m]ihomo|[c]lash|[t]ailscale|[t]proxy' || true"
   run_and_capture "runtime" "$f" "ss -lntup | grep -E '7890|7891|7892|7893|7894' || true"
 
-  f="$mdir/17_sysctl_network_runtime.log"; init_log_file "$f" "sysctl_runtime"
+  f="$mdir/$(fname 17_sysctl_network_runtime)"; init_log_file "$f" "sysctl_runtime"
   run_and_capture "sysctl" "$f" "sysctl net.ipv4.ip_forward"
   run_and_capture "sysctl" "$f" "sysctl net.ipv4.conf.all.rp_filter"
 
-  f="$mdir/18_logs_filtered.log"; init_log_file "$f" "logs_filtered"
+  f="$mdir/$(fname 18_logs_filtered)"; init_log_file "$f" "logs_filtered"
   if [ "$DEGRADED" -eq 1 ]; then
     run_and_capture "logs" "$f" "logread | tail -n $LOG_TAIL_DEGRADED"
   else
     run_and_capture "logs" "$f" "logread | tail -n $LOG_TAIL_NORMAL"
   fi
 
-  f="$mdir/19_router_connectivity.log"; init_log_file "$f" "connectivity"
+  f="$mdir/$(fname 19_router_connectivity)"; init_log_file "$f" "connectivity"
   run_and_capture "connectivity" "$f" "ping -c 3 1.1.1.1"
   run_and_capture "connectivity" "$f" "nslookup openwrt.org 1.1.1.1 2>&1 || true"
 
-  f="$mdir/20_ipset_runtime.log"; init_log_file "$f" "ipset_runtime"
-  run_and_capture "ipset" "$f" "ipset list clash_fakeip_whitelist 2>&1"
+  f="$mdir/$(fname 20_ipset_runtime)"; init_log_file "$f" "ipset_runtime"
+  run_and_capture "ipset" "$f" "ipset list clash_fakeip_whitelist 2>&1 || true"
 }
 
 collect_ssclash_touchpoints() {
@@ -472,6 +501,7 @@ parse_args() {
 
 prepare_paths() {
   mkdir -p "$OUT_BASE" || exit 2
+  HOSTNAME_SHORT="$(detect_hostname)"
   SESSION_ID="$(date +%Y%m%d-%H%M%S)_${HOSTNAME_SHORT}"
   ROOT_DIR="$OUT_BASE/$SESSION_ID"
   RAW_ROOT="$ROOT_DIR/raw"
@@ -526,27 +556,48 @@ auto_workflow() {
     collect_for_mode_label "Clash_ON" "$RAW_ROOT/11_mode_Clash_ON"
     set_clash_state off
     now="$(detect_clash_state)"
-    [ "$now" != "off" ] && record_warn "auto" "clash should be off but state=$now"
-    collect_for_mode_label "Clash_OFF" "$RAW_ROOT/10_mode_Clash_OFF"
+    off_dir="$RAW_ROOT/10_mode_Clash_OFF"
+    if [ "$now" != "off" ]; then
+      record_warn "auto" "clash should be off but state=$now"
+      off_dir="${off_dir}_untrusted"
+    fi
+    collect_for_mode_label "Clash_OFF" "$off_dir"
 
     now="$(detect_clash_state)"
-    [ "$now" != "off" ] && record_warn "auto" "clash restarted unexpectedly before ON-post capture"
+    on_post_dir="$RAW_ROOT/12_mode_Clash_ON_post"
+    if [ "$now" != "off" ]; then
+      record_warn "auto" "clash restarted unexpectedly before ON-post capture"
+      on_post_dir="${on_post_dir}_untrusted"
+    fi
     set_clash_state on
     now="$(detect_clash_state)"
-    [ "$now" != "on" ] && record_warn "auto" "clash failed to start for ON-post capture"
-    collect_for_mode_label "Clash_ON_POST" "$RAW_ROOT/12_mode_Clash_ON_post"
+    if [ "$now" != "on" ]; then
+      record_warn "auto" "clash failed to start for ON-post capture"
+      on_post_dir="${on_post_dir}_untrusted"
+    fi
+    collect_for_mode_label "Clash_ON_POST" "$on_post_dir"
 
     set_clash_state on >/dev/null 2>&1 || true
   else
     # treat unknown as off-oriented path with warnings
     [ "$initial" = "unknown" ] && record_warn "auto" "initial clash state unknown; proceeding with off->on->off sequence"
     set_clash_state off
-    collect_for_mode_label "Clash_OFF" "$RAW_ROOT/10_mode_Clash_OFF"
+    now="$(detect_clash_state)"
+    off_dir="$RAW_ROOT/10_mode_Clash_OFF"
+    if [ "$now" != "off" ]; then
+      record_warn "auto" "failed to stabilize OFF state before OFF capture"
+      off_dir="${off_dir}_untrusted"
+    fi
+    collect_for_mode_label "Clash_OFF" "$off_dir"
 
     set_clash_state on
     now="$(detect_clash_state)"
-    [ "$now" != "on" ] && record_warn "auto" "clash failed to start before ON capture"
-    collect_for_mode_label "Clash_ON" "$RAW_ROOT/11_mode_Clash_ON"
+    on_dir="$RAW_ROOT/11_mode_Clash_ON"
+    if [ "$now" != "on" ]; then
+      record_warn "auto" "clash failed to start before ON capture"
+      on_dir="${on_dir}_untrusted"
+    fi
+    collect_for_mode_label "Clash_ON" "$on_dir"
 
     now="$(detect_clash_state)"
     [ "$now" != "on" ] && record_warn "auto" "clash unexpectedly not running after ON capture"
