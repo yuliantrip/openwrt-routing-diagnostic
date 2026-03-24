@@ -113,9 +113,21 @@ init_log_file() {
 
 mask_sensitive_data() {
   in="$1"; out="$2"
+  map_append="${ANON_MAP_FILE}.append.$$"
   awk -v priv_pref="$ANON_PRIVATE_PREFIX" -v pub_pref="$ANON_PUBLIC_PREFIX" \
       -v mask_ipv6="$ANON_MASK_IPV6" -v mask_uuid="$ANON_MASK_UUID" \
-      -v mask_userpass="$ANON_MASK_USERPASS" -v mask_mac_partial="$ANON_MASK_MAC_PARTIAL" '
+      -v mask_userpass="$ANON_MASK_USERPASS" -v mask_mac_partial="$ANON_MASK_MAC_PARTIAL" \
+      -v map_file="$ANON_MAP_FILE" -v map_append="$map_append" '
+    BEGIN {
+      while ((getline line_map < map_file) > 0) {
+        split(line_map, kv, "\t");
+        if (kv[1] != "" && kv[2] != "") {
+          pub_map[kv[1]] = kv[2];
+          pub_count++;
+        }
+      }
+      close(map_file);
+    }
     function is_private(a,b,c,d) {
       if (a==127) return 2;                   # loopback, keep as-is
       if (a==10) return 1;
@@ -133,6 +145,7 @@ mask_sensitive_data() {
         pub_count++;
         p1=pub_pref; split(p1,pp,".");
         pub_map[ip]=pp[1] "." pp[2] "." int((pub_count-1)/254) "." ((pub_count-1)%254+1);
+        print ip "\t" pub_map[ip] >> map_append;
       }
       return pub_map[ip];
     }
@@ -175,7 +188,9 @@ mask_sensitive_data() {
         gsub(/([0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}/, "[IPV6_REDACTED]", line);
       print line;
     }
-  ' "$in" > "$out" 2>/dev/null || return 1
+  ' "$in" > "$out" 2>/dev/null || { rm -f "$map_append"; return 1; }
+  [ -f "$map_append" ] && cat "$map_append" >> "$ANON_MAP_FILE"
+  rm -f "$map_append"
   return 0
 }
 
@@ -344,7 +359,7 @@ collect_mode_runtime_dir() {
 
   f="$mdir/16_clash_tailscale_runtime.log"; init_log_file "$f" "clash_tailscale_runtime"
   run_and_capture "runtime" "$f" "service clash status 2>&1 || true"
-  run_and_capture "runtime" "$f" "ps w | grep -Ei 'mihomo|clash|tailscale|tproxy'"
+  run_and_capture "runtime" "$f" "ps w | grep -Ei '[m]ihomo|[c]lash|[t]ailscale|[t]proxy'"
   run_and_capture "runtime" "$f" "ss -lntup | grep -E '7890|7891|7892|7893|7894' || true"
 
   f="$mdir/17_sysctl_network_runtime.log"; init_log_file "$f" "sysctl_runtime"
@@ -473,8 +488,9 @@ prepare_paths() {
   EVENTS_LOG="$META_DIR/95_runtime_events.log"
   SUMMARY_LOG="$META_DIR/96_summary.log"
   RUN_LOG="$META_DIR/97_run_$(date +%Y%m%d-%H%M%S).log"
+  ANON_MAP_FILE="$META_DIR/.anon_ipv4_map.tsv"
 
-  touch "$MANIFEST_LOG" "$ERRORS_LOG" "$RECO_LOG" "$MATRIX_LOG" "$TOUCH_LOG" "$EVENTS_LOG" "$SUMMARY_LOG" "$RUN_LOG" || exit 2
+  touch "$MANIFEST_LOG" "$ERRORS_LOG" "$RECO_LOG" "$MATRIX_LOG" "$TOUCH_LOG" "$EVENTS_LOG" "$SUMMARY_LOG" "$RUN_LOG" "$ANON_MAP_FILE" || exit 2
 }
 
 collect_for_mode_label() {
@@ -502,6 +518,8 @@ manual_workflow() {
 
 auto_workflow() {
   initial="$(detect_clash_state)"
+  initial_proc=0
+  ps w 2>/dev/null | grep -Eq '[m]ihomo|[c]lash' && initial_proc=1
   say "INFO" "AUTO start; initial clash state=$initial"
 
   if [ "$initial" = "on" ]; then
@@ -540,6 +558,13 @@ auto_workflow() {
     set_clash_state on || record_warn "auto" "failed to restore initial state: on"
   elif [ "$initial" = "off" ]; then
     set_clash_state off || record_warn "auto" "failed to restore initial state: off"
+  else
+    # unknown status format: fallback to initial process presence heuristic
+    if [ "$initial_proc" -eq 1 ]; then
+      set_clash_state on || record_warn "auto" "failed to restore guessed initial state: on (from process heuristic)"
+    else
+      set_clash_state off || record_warn "auto" "failed to restore guessed initial state: off (from process heuristic)"
+    fi
   fi
 }
 
