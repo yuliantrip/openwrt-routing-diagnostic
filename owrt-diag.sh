@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.3.4"
 
 # =========================
 # Default settings (editable)
