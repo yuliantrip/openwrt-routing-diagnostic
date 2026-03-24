@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.1.1"
 SERVICE_NAME="clash"
 WATCH_SECS=0
 INTERVAL=1
@@ -30,7 +30,8 @@ log() {
 }
 
 probe_service_status() {
-  raw="$(service "$SERVICE_NAME" status 2>&1 || true)"
+  raw="$(service "$SERVICE_NAME" status 2>&1)"
+  rc_service=$?
   first="$(printf '%s\n' "$raw" | head -n1 | tr '[:upper:]' '[:lower:]')"
 
   # parser A: conservative negatives first
@@ -49,14 +50,34 @@ probe_service_status() {
     b="off"
   fi
 
-  log "[service] raw_first='$first' parserA=$a parserB=$b"
+  # parser C: return code heuristic
+  c="unknown"
+  [ "$rc_service" -eq 0 ] && c="on"
+  [ "$rc_service" -ne 0 ] && c="off"
+
+  # parser D: tolerant typo heuristic (e.g. rlnning)
+  d="unknown"
+  if printf '%s' "$first" | grep -Eq 'r[a-z]nning|running|active|started'; then
+    d="on"
+  fi
+  if printf '%s' "$first" | grep -Eq 'not[[:space:]]+running|inactive|stopped|dead'; then
+    d="off"
+  fi
+
+  bytes="n/a"
+  if command -v od >/dev/null 2>&1; then
+    bytes="$(printf '%s' "$first" | od -An -tx1 | tr -s ' ' | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
+  fi
+
+  log "[service] rc=$rc_service raw_first='$first' bytes='$bytes' parserA=$a parserB=$b parserC=$c parserD=$d"
 }
 
 probe_initd_status() {
   if [ -x "/etc/init.d/$SERVICE_NAME" ]; then
-    raw="$(/etc/init.d/$SERVICE_NAME status 2>&1 || true)"
+    raw="$(/etc/init.d/$SERVICE_NAME status 2>&1)"
+    rc_initd=$?
     first="$(printf '%s\n' "$raw" | head -n1 | tr '[:upper:]' '[:lower:]')"
-    log "[init.d] raw_first='$first'"
+    log "[init.d] rc=$rc_initd raw_first='$first'"
   else
     log "[init.d] /etc/init.d/$SERVICE_NAME not found"
   fi
@@ -99,7 +120,7 @@ combined_decision() {
   reason=""
   if printf '%s' "$srv" | grep -Eq 'not[[:space:]]+running|inactive|stopped|dead'; then
     status="off"; reason="service-status-negative"
-  elif printf '%s' "$srv" | grep -Eq 'running|started|active'; then
+  elif printf '%s' "$srv" | grep -Eq 'r[a-z]nning|running|started|active'; then
     status="on"; reason="service-status-positive"
   elif [ -n "$p" ]; then
     status="on"; reason="process-heuristic"
