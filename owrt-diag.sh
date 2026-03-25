@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.3.7"
+SCRIPT_VERSION="0.4.0"
 
 # =========================
 # Default settings (editable)
@@ -22,8 +22,9 @@ LOG_TAIL_NORMAL="800"                     # log tail lines in normal mode
 LOG_TAIL_DEGRADED="200"                   # log tail lines in degraded mode
 DNS_TAIL_LINES="300"                      # dns log tail lines
 
-ANON_PRIVATE_PREFIX="55.55"               # private/CGNAT => 55.55.<oct3>.<oct4>
-ANON_PUBLIC_PREFIX="198.18"               # public IP deterministic pool
+ANON_PRIVATE_PREFIX="192.168.55"          # LAN/private default mask prefix
+ANON_TAILSCALE_PREFIX="100.55"            # tailscale (100.64.0.0/10) default mask prefix
+ANON_PUBLIC_PREFIX="198.18"               # public IP default mask prefix
 ANON_MASK_IPV6=1                          # 1=mask IPv6
 ANON_MASK_UUID=1                          # 1=mask UUID
 ANON_MASK_USERPASS=1                      # 1=mask usernames/passwords/tokens
@@ -39,6 +40,8 @@ SSCLASH_FILE=""
 AUTO_MODE=0
 REQUESTED_CLASH=""  # on|off
 MODE=""
+TAR_MODE=""
+ARCHIVE_PATH=""
 
 STATUS_OK=0
 STATUS_WARN=0
@@ -48,7 +51,7 @@ DEGRADED=0
 usage() {
   cat <<USAGE
 Usage:
-  $0 [--clash on|off] [--auto] [--out $OUT_BASE_DEFAULT] [--ssclash-dir $SSCLASH_DIR_DEFAULT] [--ssclash-file /path/to/clash-rules.sh] [--no-anon]
+  $0 [--clash on|off] [--auto] [--out $OUT_BASE_DEFAULT] [--ssclash-dir $SSCLASH_DIR_DEFAULT] [--ssclash-file /path/to/clash-rules.sh] [--no-anon] [--tar full|raw|anon|no]
 
 Options:
   --clash         Manual target mode: on/off
@@ -57,6 +60,7 @@ Options:
   --ssclash-dir   Directory with clash-rules scripts (default: $SSCLASH_DIR_DEFAULT)
   --ssclash-file  Exact path to clash-rules script (overrides --ssclash-dir)
   --no-anon       Skip anonymized copies (raw only)
+  --tar           Create archive mode: full|raw|anon|no
   -h|--help       Show help
 
 Defaults without parameters:
@@ -145,7 +149,7 @@ init_log_file() {
 mask_sensitive_data() {
   in="$1"; out="$2"
   map_append="${ANON_MAP_FILE}.append.$$"
-  awk -v priv_pref="$ANON_PRIVATE_PREFIX" -v pub_pref="$ANON_PUBLIC_PREFIX" \
+  awk -v priv_pref="$ANON_PRIVATE_PREFIX" -v ts_pref="$ANON_TAILSCALE_PREFIX" -v pub_pref="$ANON_PUBLIC_PREFIX" \
       -v mask_ipv6="$ANON_MASK_IPV6" -v mask_uuid="$ANON_MASK_UUID" \
       -v mask_userpass="$ANON_MASK_USERPASS" -v mask_mac_partial="$ANON_MASK_MAC_PARTIAL" \
       -v map_file="$ANON_MAP_FILE" -v map_append="$map_append" '
@@ -159,26 +163,56 @@ mask_sensitive_data() {
       }
       close(map_file);
     }
+    function split_prefix(pref, arr,    n,i,tmp) {
+      n=split(pref,tmp,".");
+      for (i=1; i<=n; i++) {
+        if (tmp[i] !~ /^[0-9]+$/) return 0;
+        if (tmp[i] < 0 || tmp[i] > 255) return 0;
+        arr[i]=tmp[i]+0;
+      }
+      return n;
+    }
+    function apply_ipv4_prefix(pref, a,b,c,d, out, n, pp, i, src) {
+      n=split_prefix(pref, pp);
+      if (n < 1 || n > 4) n=2;
+      out="";
+      for (i=1; i<=n; i++) {
+        out = out (i==1 ? "" : ".") pp[i];
+      }
+      src[1]=a; src[2]=b; src[3]=c; src[4]=d;
+      for (i=n+1; i<=4; i++) {
+        out = out "." src[i];
+      }
+      return out;
+    }
     function is_private(a,b,c,d) {
       if (a==127) return 2;                   # loopback, keep as-is
+      if (a==100 && b>=64 && b<=127) return 3; # tailscale/CGNAT-like
       if (a==10) return 1;
       if (a==192 && b==168) return 1;
       if (a==172 && b>=16 && b<=31) return 1;
-      if (a==100 && b>=64 && b<=127) return 1; # CGNAT/Tailscale-like
       return 0;
     }
     function map_ipv4(ip,    a,b,c,d,kind,p1,p2) {
       split(ip,o,"."); a=o[1]+0; b=o[2]+0; c=o[3]+0; d=o[4]+0;
       kind=is_private(a,b,c,d);
       if (kind==2) return ip; # loopback
-      if (kind==1) return priv_pref "." c "." d;
+      if (kind==1) return apply_ipv4_prefix(priv_pref, a,b,c,d);
+      if (kind==3) return apply_ipv4_prefix(ts_pref, a,b,c,d);
       if (!(ip in pub_map)) {
         pub_count++;
-        p1=pub_pref; split(p1,pp,".");
-        pub_map[ip]=pp[1] "." pp[2] "." int((pub_count-1)/254) "." ((pub_count-1)%254+1);
+        p1=apply_ipv4_prefix(pub_pref, 0,0, int((pub_count-1)/254), ((pub_count-1)%254+1));
+        pub_map[ip]=p1;
         print ip "\t" pub_map[ip] >> map_append;
       }
       return pub_map[ip];
+    }
+    function mask_ipv6_addr(ipv6, parts, n, i, tail) {
+      n=split(ipv6, parts, ":");
+      tail=parts[n];
+      if (tail == "" && n > 1) tail=parts[n-1];
+      if (tail == "") tail="1";
+      return "[IPV6_MASKED]::" tail;
     }
     function mask_mac(mac, m) {
       split(mac,m,":");
@@ -215,8 +249,19 @@ mask_sensitive_data() {
       }
       line=line rest;
 
-      if (mask_ipv6 == 1)
-        gsub(/([0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}/, "[IPV6_REDACTED]", line);
+      if (mask_ipv6 == 1) {
+        rest=line; line="";
+        while (match(rest, /([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}/)) {
+          ipv6=substr(rest, RSTART, RLENGTH);
+          if (index(ipv6, ":") > 0 && ipv6 !~ /^:+$/) {
+            line=line substr(rest,1,RSTART-1) mask_ipv6_addr(ipv6);
+          } else {
+            line=line substr(rest,1,RSTART-1) ipv6;
+          }
+          rest=substr(rest,RSTART+RLENGTH);
+        }
+        line=line rest;
+      }
       print line;
     }
   ' "$in" > "$out" 2>/dev/null || { rm -f "$map_append"; return 1; }
@@ -425,6 +470,12 @@ collect_static() {
   run_and_capture "modules" "$f" "modinfo nf_tproxy_ipv4 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nf_tproxy_ipv6 2>/dev/null || true"
   run_and_capture "modules" "$f" "modinfo nft_socket 2>/dev/null || true"
+
+  f="$STATIC_DIR/$(fname 04_uci_network_firewall_dhcp_system)"; init_log_file "$f" "uci_network_firewall_dhcp_system"
+  run_and_capture "uci" "$f" "uci show network 2>/dev/null"
+  run_and_capture "uci" "$f" "uci show firewall 2>/dev/null"
+  run_and_capture "uci" "$f" "uci show dhcp 2>/dev/null"
+  run_and_capture "uci" "$f" "uci show system 2>/dev/null"
 }
 
 collect_mode_runtime_dir() {
@@ -527,6 +578,8 @@ write_manifest() {
     echo "output_base=$OUT_BASE"
     echo "ssclash_dir=$SSCLASH_DIR"
     echo "ssclash_file=$SSCLASH_FILE"
+    echo "tar_mode=${TAR_MODE:-no}"
+    echo "archive_path=${ARCHIVE_PATH:-}"
     echo "degraded=$DEGRADED"
     echo "status_ok=$STATUS_OK"
     echo "status_warn=$STATUS_WARN"
@@ -546,6 +599,67 @@ write_summary() {
   } > "$SUMMARY_LOG"
 }
 
+prompt_tar_mode() {
+  [ -n "$TAR_MODE" ] && return 0
+  if [ -t 0 ]; then
+    echo
+    echo "Archive output?"
+    echo "  1) full (entire session)"
+    echo "  2) raw  (only raw data)"
+    echo "  3) anon (only anonymized data)"
+    echo "  4) no   (do not create archive)"
+    printf "Choose [1-4] (default 1): "
+    read ans
+    case "$ans" in
+      2) TAR_MODE="raw" ;;
+      3) TAR_MODE="anon" ;;
+      4) TAR_MODE="no" ;;
+      *) TAR_MODE="full" ;;
+    esac
+  else
+    TAR_MODE="no"
+    say "INFO" "--tar not provided and no interactive TTY; archive creation skipped"
+  fi
+}
+
+create_archive() {
+  mode="$1"
+  [ "$mode" = "no" ] && { ARCHIVE_PATH=""; return 0; }
+  ARCHIVE_PATH="$OUT_BASE/${SESSION_ID}__${mode}.tar.gz"
+
+  if ! command -v tar >/dev/null 2>&1; then
+    record_warn "archive" "tar command missing; archive skipped"
+    ARCHIVE_PATH=""
+    return 1
+  fi
+
+  case "$mode" in
+    full) tar -C "$OUT_BASE" -czf "$ARCHIVE_PATH" "$SESSION_ID" ;;
+    raw) tar -C "$ROOT_DIR" -czf "$ARCHIVE_PATH" "raw" "meta" ;;
+    anon)
+      if [ "$NO_ANON" -eq 1 ]; then
+        record_warn "archive" "anon archive requested but --no-anon used"
+        ARCHIVE_PATH=""
+        return 1
+      fi
+      tar -C "$ROOT_DIR" -czf "$ARCHIVE_PATH" "anon" "meta"
+      ;;
+    *)
+      record_warn "archive" "unknown archive mode: $mode"
+      ARCHIVE_PATH=""
+      return 1
+      ;;
+  esac
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    record_warn "archive" "failed creating archive mode=$mode rc=$rc"
+    ARCHIVE_PATH=""
+    return 1
+  fi
+  say "INFO" "Archive created: $ARCHIVE_PATH"
+  return 0
+}
+
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -555,6 +669,7 @@ parse_args() {
       --ssclash-dir) SSCLASH_DIR="${2:-}"; shift 2 ;;
       --ssclash-file) SSCLASH_FILE="${2:-}"; shift 2 ;;
       --no-anon) NO_ANON=1; shift ;;
+      --tar) TAR_MODE="${2:-}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -562,6 +677,10 @@ parse_args() {
 
   if [ -n "$REQUESTED_CLASH" ] && [ "$REQUESTED_CLASH" != "on" ] && [ "$REQUESTED_CLASH" != "off" ]; then
     echo "--clash must be on|off" >&2
+    exit 2
+  fi
+  if [ -n "$TAR_MODE" ] && [ "$TAR_MODE" != "full" ] && [ "$TAR_MODE" != "raw" ] && [ "$TAR_MODE" != "anon" ] && [ "$TAR_MODE" != "no" ]; then
+    echo "--tar must be full|raw|anon|no" >&2
     exit 2
   fi
 }
@@ -704,8 +823,10 @@ main() {
   fi
 
   make_anonymous_copy
-  write_manifest
   write_summary
+  prompt_tar_mode
+  create_archive "$TAR_MODE" || true
+  write_manifest
   log_event "session finished"
   say "INFO" "Completed. Summary: ok=$STATUS_OK warn=$STATUS_WARN fail=$STATUS_FAIL"
 
