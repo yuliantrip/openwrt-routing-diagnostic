@@ -18,7 +18,7 @@ sanitize_hostname() {
 parse_status_line() {
   line="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$line" in
-    *not\ running*|*inactive*|*stopped*|*dead*) echo "off" ;;
+    *not\ r?nning*|*inactive*|*stopped*|*dead*) echo "off" ;;
     *running*|*r?nning*|*active*|*started*) echo "on" ;;
     *) echo "unknown" ;;
   esac
