@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.3.5"
+SCRIPT_VERSION="0.3.6"
 
 # =========================
 # Default settings (editable)
@@ -64,12 +64,26 @@ Defaults without parameters:
 USAGE
 }
 
+sanitize_hostname() {
+  raw="$1"
+
+  # Keep only safe ASCII filename characters.
+  safe="$(printf '%s' "$raw" | LC_ALL=C tr -cd '[:alnum:]._-')"
+  # Collapse repeating separators and trim edges.
+  safe="$(printf '%s' "$safe" | sed 's/[._-][._-]*/_/g; s/^_\\+//; s/_\\+$//')"
+  # Avoid single separator/dot values.
+  case "$safe" in
+    ""|"."|".."|"-") echo "_unknown" ;;
+    *) echo "$safe" ;;
+  esac
+}
+
 detect_hostname() {
   h="$(hostname 2>/dev/null || true)"
   [ -z "$h" ] && h="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
   [ -z "$h" ] && h="$(uname -n 2>/dev/null || true)"
-  [ -z "$h" ] && h="unknown"
-  printf '%s' "$h" | tr -c '[:alnum:]._-' '_' | sed 's/^_\\+//; s/_\\+$//'
+  [ -z "$h" ] && h="_unknown"
+  sanitize_hostname "$h"
 }
 
 fname() {
@@ -256,16 +270,70 @@ detect_pkg_manager() {
   echo "unknown"
 }
 
-detect_clash_state() {
-  if ! command -v service >/dev/null 2>&1; then
+parse_status_line() {
+  line="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  if printf '%s' "$line" | grep -Eq 'not[[:space:]]+running|inactive|stopped|dead'; then
+    echo "off"
+  elif printf '%s' "$line" | grep -Eq 'r[a-z]nning|running|active|started'; then
+    echo "on"
+  else
     echo "unknown"
-    return
   fi
-  out="$(service "$CLASH_SERVICE_NAME" status 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]')"
-  case "$out" in
-    *not*running*|*inactive*|*stopped*) echo "off" ;;
-    *running*) echo "on" ;;
-    *) echo "unknown" ;;
+}
+
+detect_clash_state_raw() {
+  parser_service="unknown"
+  parser_initd="unknown"
+  proc_on=0
+  port_on=0
+
+  if command -v service >/dev/null 2>&1; then
+    first_service="$(service "$CLASH_SERVICE_NAME" status 2>/dev/null | head -n1)"
+    parser_service="$(parse_status_line "$first_service")"
+  fi
+
+  if [ -x "/etc/init.d/$CLASH_SERVICE_NAME" ]; then
+    first_initd="$(/etc/init.d/"$CLASH_SERVICE_NAME" status 2>/dev/null | head -n1)"
+    parser_initd="$(parse_status_line "$first_initd")"
+  fi
+
+  pidof clash >/dev/null 2>&1 && proc_on=1
+  pidof mihomo >/dev/null 2>&1 && proc_on=1
+  ps w 2>/dev/null | grep -Eq '[m]ihomo|[c]lash' && proc_on=1
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntup 2>/dev/null | grep -Eq ':(7890|7891|7892|7893|7894)\b' && port_on=1
+  fi
+
+  if [ "$parser_service" = "on" ] || [ "$parser_initd" = "on" ]; then
+    if [ "$proc_on" -eq 1 ] || [ "$port_on" -eq 1 ]; then
+      echo "on"
+    else
+      echo "transition"
+    fi
+  elif [ "$parser_service" = "off" ] || [ "$parser_initd" = "off" ]; then
+    if [ "$proc_on" -eq 0 ] && [ "$port_on" -eq 0 ]; then
+      echo "off"
+    else
+      echo "transition"
+    fi
+  else
+    if [ "$proc_on" -eq 1 ] || [ "$port_on" -eq 1 ]; then
+      echo "on"
+    else
+      echo "unknown"
+    fi
+  fi
+}
+
+detect_clash_state() {
+  raw_state="$(detect_clash_state_raw)"
+  case "$raw_state" in
+    on|off|unknown) echo "$raw_state" ;;
+    transition) echo "unknown" ;;
+    *)
+      echo "unknown"
+      ;;
   esac
 }
 
