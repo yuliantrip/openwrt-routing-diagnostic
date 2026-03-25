@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.3.6"
+SCRIPT_VERSION="0.3.7"
 
 # =========================
 # Default settings (editable)
@@ -67,8 +67,9 @@ USAGE
 sanitize_hostname() {
   raw="$1"
 
-  # Keep only safe ASCII filename characters.
-  safe="$(printf '%s' "$raw" | LC_ALL=C tr -cd '[:alnum:]._-')"
+  # BusyBox tr/locale combinations can behave unexpectedly with POSIX classes.
+  # Use sed with explicit ASCII allowlist for predictable output.
+  safe="$(printf '%s' "$raw" | sed 's/[^A-Za-z0-9._-]/_/g')"
   # Collapse repeating separators and trim edges.
   safe="$(printf '%s' "$safe" | sed 's/[._-][._-]*/_/g; s/^_\\+//; s/_\\+$//')"
   # Avoid single separator/dot values.
@@ -272,13 +273,11 @@ detect_pkg_manager() {
 
 parse_status_line() {
   line="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  if printf '%s' "$line" | grep -Eq 'not[[:space:]]+running|inactive|stopped|dead'; then
-    echo "off"
-  elif printf '%s' "$line" | grep -Eq 'r[a-z]nning|running|active|started'; then
-    echo "on"
-  else
-    echo "unknown"
-  fi
+  case "$line" in
+    *not\ running*|*not\ r?nning*|*inactive*|*stopped*|*dead*) echo "off" ;;
+    *running*|*r?nning*|*active*|*started*) echo "on" ;;
+    *) echo "unknown" ;;
+  esac
 }
 
 detect_clash_state_raw() {
