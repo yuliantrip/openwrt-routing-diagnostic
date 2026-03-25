@@ -18,7 +18,7 @@ sanitize_hostname() {
 parse_status_line() {
   line="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$line" in
-    *not\ r?nning*|*inactive*|*stopped*|*dead*) echo "off" ;;
+    *not\ running*|*not\ r?nning*|*inactive*|*stopped*|*dead*) echo "off" ;;
     *running*|*r?nning*|*active*|*started*) echo "on" ;;
     *) echo "unknown" ;;
   esac
@@ -44,6 +44,7 @@ running
 rlnning
 inactive
 not running
+not rlnning
 started
 ???
 CASES
@@ -56,12 +57,11 @@ run_live_system_tests() {
   service_name="${1:-clash}"
   echo "== live system probes =="
 
-  if command -v hostname >/dev/null 2>&1; then
-    h="$(hostname 2>/dev/null || true)"
-    printf "live hostname='%s' -> sanitized='%s'\n" "$h" "$(sanitize_hostname "$h")"
-  else
-    echo "hostname command missing"
-  fi
+  h="$(hostname 2>/dev/null || true)"
+  [ -z "$h" ] && h="$(cat /proc/sys/kernel/hostname 2>/dev/null || true)"
+  [ -z "$h" ] && h="$(uname -n 2>/dev/null || true)"
+  [ -z "$h" ] && h="_unknown"
+  printf "live hostname='%s' -> sanitized='%s'\n" "$h" "$(sanitize_hostname "$h")"
 
   if command -v service >/dev/null 2>&1; then
     first="$(service "$service_name" status 2>&1 | head -n1)"
@@ -69,6 +69,28 @@ run_live_system_tests() {
       "$service_name" "$first" "$(parse_status_line "$first")"
   else
     echo "service command missing"
+  fi
+
+  if [ -x "/etc/init.d/$service_name" ]; then
+    first_initd="$(/etc/init.d/"$service_name" status 2>&1 | head -n1)"
+    printf "init.d %s status first_line='%s' -> parsed='%s'\n" \
+      "$service_name" "$first_initd" "$(parse_status_line "$first_initd")"
+  else
+    echo "/etc/init.d/$service_name missing"
+  fi
+
+  pid_clash="$(pidof clash 2>/dev/null || true)"
+  pid_mihomo="$(pidof mihomo 2>/dev/null || true)"
+  printf "pidof clash='%s' pidof mihomo='%s'\n" "${pid_clash:-none}" "${pid_mihomo:-none}"
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lntup 2>/dev/null | grep -Eq ':(7890|7891|7892|7893|7894)\b'; then
+      echo "ss 789x: present"
+    else
+      echo "ss 789x: absent"
+    fi
+  else
+    echo "ss command missing"
   fi
 }
 
