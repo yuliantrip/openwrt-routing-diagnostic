@@ -1,0 +1,1905 @@
+#!/bin/sh
+
+#version 3.6.0-r1 owrt24.10
+# This script configures nftables or iptables to redirect network traffic
+# through the Clash proxy based on settings defined in /opt/clash/settings.
+# It supports two modes:
+# 1. Exclude Mode: Proxies all traffic except from specified interfaces (e.g., WAN).
+# 2. Explicit Mode: Proxies traffic ONLY from specified interfaces (e.g., LAN bridge).
+
+CONFIG_FILE="/opt/clash/config.yaml"
+SETTINGS_FILE="/opt/clash/settings"
+
+# Directory to cache subscription IPs for performance
+readonly SUBSCRIPTION_CACHE_FILE="/tmp/clash/clash_subscription_ips.cache"
+# Lock file to prevent concurrent access to cache
+readonly SUBSCRIPTION_LOCK_FILE="/tmp/clash/clash_subscription.lock"
+# Reserved networks
+readonly RESERVED_NETWORKS="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+# Fake-ip whitelist IP-CIDR technical list (used only by the firewall, not by config.yaml)
+readonly FAKEIP_WHITELIST_FILE="/opt/clash/lst/fakeip-whitelist-ipcidr.txt"
+readonly FAKEIP_IPSET_NAME="clash_fakeip_whitelist"
+
+# Global Settings Variables
+# These are populated by load_all_settings_once() to avoid repeated file reads.
+MODE="exclude"
+PROXY_MODE="tproxy"
+AUTO_DETECT_LAN="true"
+AUTO_DETECT_WAN="true"
+BLOCK_QUIC="true"
+DETECTED_LAN=""
+DETECTED_WAN=""
+INCLUDED_INTERFACES=""
+EXCLUDED_INTERFACES=""
+# Populated in start() when fake-ip-filter-mode: whitelist is detected
+FAKE_IP_FILTER_MODE="blacklist"
+FAKEIP_WHITELIST_IPS=""
+
+# =============================================================================
+# SECTION: Utilities — logging, settings loader, IP helpers
+# =============================================================================
+
+# Function to log messages
+msg() {
+    logger -p daemon.info -st "clash-rules[$$]" "$*"
+}
+
+# Function to load all settings from the settings file into global variables.
+# This is called only once to improve performance.
+load_all_settings_once() {
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        msg "Settings file not found. Using default values."
+        return
+    fi
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            "INTERFACE_MODE") MODE="$value" ;;
+            "PROXY_MODE") PROXY_MODE="$value" ;;
+            "AUTO_DETECT_LAN") AUTO_DETECT_LAN="$value" ;;
+            "AUTO_DETECT_WAN") AUTO_DETECT_WAN="$value" ;;
+            "BLOCK_QUIC") BLOCK_QUIC="$value" ;;
+            "DETECTED_LAN") DETECTED_LAN="$value" ;;
+            "DETECTED_WAN") DETECTED_WAN="$value" ;;
+            "INCLUDED_INTERFACES") INCLUDED_INTERFACES="$value" ;;
+            "EXCLUDED_INTERFACES") EXCLUDED_INTERFACES="$value" ;;
+        esac
+    done < "$SETTINGS_FILE"
+
+    local settings_part=""
+    [ -n "$MODE" ] && settings_part="$settings_part, Mode: $MODE"
+    [ -n "$PROXY_MODE" ] && settings_part="$settings_part, Proxy mode: $PROXY_MODE"
+    [ -n "$AUTO_DETECT_LAN" ] && settings_part="$settings_part, Auto-detect LAN: $AUTO_DETECT_LAN"
+    [ -n "$AUTO_DETECT_WAN" ] && settings_part="$settings_part, Auto-detect WAN: $AUTO_DETECT_WAN"
+    [ -n "$BLOCK_QUIC" ] && settings_part="$settings_part, Block QUIC: $BLOCK_QUIC"
+    [ -n "$DETECTED_LAN" ] && settings_part="$settings_part, Detected LAN: $DETECTED_LAN"
+    [ -n "$DETECTED_WAN" ] && settings_part="$settings_part, Detected WAN: $DETECTED_WAN"
+    [ -n "$INCLUDED_INTERFACES" ] && settings_part="$settings_part, Included interfaces: '$INCLUDED_INTERFACES'"
+    [ -n "$EXCLUDED_INTERFACES" ] && settings_part="$settings_part, Excluded interfaces: '$EXCLUDED_INTERFACES'"
+
+    if [ -n "$settings_part" ]; then
+        msg "Settings loaded: ${settings_part#*, }"
+    else
+        msg "Settings loaded (no values specified in settings file)."
+    fi
+}
+
+# Function to check if a string is a valid IP address
+is_valid_ip() {
+    local ip="$1"
+    echo "$ip" | grep -qE '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+}
+
+# Function to validate an IPv4 address or IPv4/prefix-length CIDR entry
+is_valid_ipv4_cidr() {
+    local entry="$1"
+    local ip prefix
+    case "$entry" in
+        */*)
+            ip="${entry%/*}"
+            prefix="${entry#*/}"
+            if is_valid_ip "$ip" && echo "$prefix" | grep -qE '^([0-9]|[12][0-9]|3[0-2])$'; then
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            is_valid_ip "$entry"
+            ;;
+    esac
+}
+
+# Read and validate entries from the fakeip whitelist file.
+# Outputs valid IPv4/CIDR entries one per line; skips comments and blank lines.
+read_fakeip_whitelist_entries() {
+    [ -f "$FAKEIP_WHITELIST_FILE" ] || return 0
+    while IFS= read -r line; do
+        line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+        case "$line" in '#'*) continue ;; esac
+        if is_valid_ipv4_cidr "$line"; then
+            echo "$line"
+        else
+            msg "WARNING: skipping invalid IP/CIDR in fakeip whitelist: '$line'"
+        fi
+    done < "$FAKEIP_WHITELIST_FILE"
+}
+
+# Create the fakeip whitelist ipset if it does not exist, then flush it ready for population.
+ensure_fakeip_ipset() {
+    if ! ipset list "$FAKEIP_IPSET_NAME" >/dev/null 2>&1; then
+        ipset create "$FAKEIP_IPSET_NAME" hash:net maxelem 65536 2>/dev/null || {
+            msg "ERROR: Failed to create ipset $FAKEIP_IPSET_NAME"
+            return 1
+        }
+        msg "Created ipset: $FAKEIP_IPSET_NAME"
+    else
+        ipset flush "$FAKEIP_IPSET_NAME"
+    fi
+}
+
+# Populate the fakeip whitelist ipset from FAKEIP_WHITELIST_IPS (already loaded into memory).
+populate_fakeip_ipset_from_file() {
+    if [ -z "$FAKEIP_WHITELIST_IPS" ]; then
+        msg "Fakeip whitelist is empty, ipset $FAKEIP_IPSET_NAME left empty"
+        return 0
+    fi
+    echo "$FAKEIP_WHITELIST_IPS" | while IFS= read -r cidr; do
+        [ -n "$cidr" ] && ipset add "$FAKEIP_IPSET_NAME" "$cidr" 2>/dev/null
+    done
+    msg "Populated ipset $FAKEIP_IPSET_NAME with $(echo "$FAKEIP_WHITELIST_IPS" | wc -l | xargs) entries"
+}
+
+# Function to resolve domain name to IP addresses
+resolve_domain() {
+    local domain="$1"
+    local resolved_ips=""
+
+    # Use nslookup to resolve the domain
+    if command -v nslookup >/dev/null 2>&1; then
+        resolved_ips=$(nslookup "$domain" 2>/dev/null | awk '/^Address: / { print $2 }' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+
+    # If nslookup failed or not available, try using getent
+    if [ -z "$resolved_ips" ] && command -v getent >/dev/null 2>&1;
+    then
+        resolved_ips=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+
+    # Ensure each IP is on a separate line and remove duplicates
+    if [ -n "$resolved_ips" ]; then
+        echo "$resolved_ips" | tr ' ' '\n' | grep -v '^$' | sort -u
+    fi
+}
+
+# Function to decode base64 using available utilities or pure shell fallback
+# Tries multiple methods: standard base64, busybox, openssl, pure shell
+decode_base64() {
+    local encoded="$1"
+
+    # Remove whitespace and newlines
+    encoded=$(echo "$encoded" | tr -d '\n\r \t')
+
+    # Check if string looks like valid base64
+    if ! echo "$encoded" | grep -qE '^[A-Za-z0-9+/]*={0,2}$'; then
+        msg "WARNING: String does not look like valid base64"
+        return 1
+    fi
+
+    # Try available utilities in order of efficiency
+
+    # Standard base64 (fastest)
+    if command -v base64 >/dev/null 2>&1; then
+        echo "$encoded" | base64 -d 2>/dev/null && return 0
+    fi
+
+    # BusyBox base64
+    if busybox base64 -d >/dev/null 2>&1; then
+        echo "$encoded" | busybox base64 -d 2>/dev/null && return 0
+    fi
+
+    # OpenSSL
+    if command -v openssl >/dev/null 2>&1; then
+        echo "$encoded" | openssl base64 -d -A 2>/dev/null && return 0
+    fi
+
+    # Pure shell fallback (slow but reliable)
+    msg "Using pure shell base64 decoder (this may be slow)"
+
+    # Helper function to convert base64 character to number
+    char_to_base64_num() {
+        local char="$1"
+        case "$char" in
+            A) echo 0 ;;  B) echo 1 ;;  C) echo 2 ;;  D) echo 3 ;;  E) echo 4 ;;  F) echo 5 ;;
+            G) echo 6 ;;  H) echo 7 ;;  I) echo 8 ;;  J) echo 9 ;;  K) echo 10 ;; L) echo 11 ;;
+            M) echo 12 ;; N) echo 13 ;; O) echo 14 ;; P) echo 15 ;; Q) echo 16 ;; R) echo 17 ;;
+            S) echo 18 ;; T) echo 19 ;; U) echo 20 ;; V) echo 21 ;; W) echo 22 ;; X) echo 23 ;;
+            Y) echo 24 ;; Z) echo 25 ;;
+            a) echo 26 ;; b) echo 27 ;; c) echo 28 ;; d) echo 29 ;; e) echo 30 ;; f) echo 31 ;;
+            g) echo 32 ;; h) echo 33 ;; i) echo 34 ;; j) echo 35 ;; k) echo 36 ;; l) echo 37 ;;
+            m) echo 38 ;; n) echo 39 ;; o) echo 40 ;; p) echo 41 ;; q) echo 42 ;; r) echo 43 ;;
+            s) echo 44 ;; t) echo 45 ;; u) echo 46 ;; v) echo 47 ;; w) echo 48 ;; x) echo 49 ;;
+            y) echo 50 ;; z) echo 51 ;;
+            0) echo 52 ;; 1) echo 53 ;; 2) echo 54 ;; 3) echo 55 ;; 4) echo 56 ;; 5) echo 57 ;;
+            6) echo 58 ;; 7) echo 59 ;; 8) echo 60 ;; 9) echo 61 ;;
+            +) echo 62 ;; /) echo 63 ;;
+            *) echo -1 ;;
+        esac
+    }
+
+    # Helper function to decode 4 base64 numbers into bytes
+    decode_base64_chunk() {
+        local n1=${1:-0} n2=${2:-0} n3=${3:-0} n4=${4:-0}
+
+        # First byte: first 6 bits from n1 + first 2 bits from n2
+        local byte1=$(( (n1 << 2) | (n2 >> 4) ))
+        printf "\\$(printf '%03o' $byte1)"
+
+        # Second byte if n3 exists
+        if [ "$3" ]; then
+            local byte2=$(( ((n2 & 15) << 4) | (n3 >> 2) ))
+            printf "\\$(printf '%03o' $byte2)"
+
+            # Third byte if n4 exists
+            if [ "$4" ]; then
+                local byte3=$(( ((n3 & 3) << 6) | n4 ))
+                printf "\\$(printf '%03o' $byte3)"
+            fi
+        fi
+    }
+
+    # Process encoded string in 4-character chunks
+    local i=0
+    local len=${#encoded}
+
+    while [ $i -lt $len ]; do
+        # Extract next 4 characters
+        local c1 c2 c3 c4
+        c1=$(echo "$encoded" | cut -c$((i+1)))
+        c2=$(echo "$encoded" | cut -c$((i+2)))
+        c3=$(echo "$encoded" | cut -c$((i+3)))
+        c4=$(echo "$encoded" | cut -c$((i+4)))
+
+        # Convert to numbers
+        local n1 n2 n3 n4
+        n1=$(char_to_base64_num "$c1")
+        n2=$(char_to_base64_num "$c2")
+        n3=$(char_to_base64_num "$c3")
+        n4=$(char_to_base64_num "$c4")
+
+        # Check for errors or padding
+        if [ "$n1" -eq -1 ] || [ "$n2" -eq -1 ]; then
+            break
+        fi
+
+        # Decode chunk
+        if [ "$n3" -eq -1 ]; then
+            decode_base64_chunk $n1 $n2
+            break
+        elif [ "$n4" -eq -1 ]; then
+            decode_base64_chunk $n1 $n2 $n3
+            break
+        else
+            decode_base64_chunk $n1 $n2 $n3 $n4
+        fi
+
+        i=$((i + 4))
+    done
+}
+
+# =============================================================================
+# SECTION: Config parsing — proxy-providers, subscription IPs, fake-ip
+# =============================================================================
+
+# Function to extract proxy-providers configuration from config.yaml
+extract_proxy_providers() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 1
+    fi
+
+    # Extract proxy-providers section and parse it
+    awk '
+    /^proxy-providers:/ { in_providers = 1; next }
+    /^[a-zA-Z][^[:space:]]*:/ && !/^[[:space:]]/ {
+        if (in_providers) {
+            # Save previous provider if we have all required fields
+            if (provider && path && interval) {
+                print provider "|" path "|" interval
+            }
+            in_providers = 0
+        }
+    }
+    in_providers {
+        # Check for provider name
+        if (/^[[:space:]]*[^[:space:]]+.*:[[:space:]]*$/) {
+            # Save previous provider if we have all required fields
+            if (provider && path && interval) {
+                print provider "|" path "|" interval
+            }
+            # Start new provider - preserve Unicode characters
+            gsub(/^[[:space:]]*/, "")
+            gsub(/:.*/, "")
+            provider = $0
+            path = ""
+            interval = ""
+            next
+        }
+
+        # Extract path
+        if (/^[[:space:]]*path:[[:space:]]*/) {
+            gsub(/^[[:space:]]*path:[[:space:]]*/, "")
+            gsub(/[[:space:]]*$/, "")
+            gsub(/["'"'"']/, "")  # Remove quotes
+            sub(/#.*/, "")
+            path = $0
+            next
+        }
+
+        # Extract interval
+        if (/^[[:space:]]*interval:[[:space:]]*/) {
+            gsub(/^[[:space:]]*interval:[[:space:]]*/, "")
+            gsub(/[[:space:]]*$/, "")
+            sub(/#.*/, "")
+            interval = $0
+            next
+        }
+    }
+    END {
+        # Dont forget the last provider
+        if (provider && path && interval) {
+            print provider "|" path "|" interval
+        }
+    }
+    ' "$CONFIG_FILE"
+}
+
+# Function to get base directory for proxy-providers paths
+get_providers_base_dir() {
+    local config_dir=$(dirname "$CONFIG_FILE")
+    echo "$config_dir"
+}
+
+# Function to extract servers from a subscription file (base64 encoded, YAML or plain text with direct proxy URLs)
+extract_servers_from_subscription() {
+    local file_path="$1"
+
+    if [ ! -f "$file_path" ]; then
+        return 1
+    fi
+
+    # Read entire file content
+    local file_content=$(cat "$file_path")
+    local first_line=$(head -1 "$file_path")
+
+    # Check if file is entirely base64
+    if [ $(echo "$file_content" | wc -l) -eq 1 ] && echo "$first_line" | grep -qE '^[A-Za-z0-9+/=]+$' && [ ${#first_line} -gt 50 ]; then
+        msg "Processing single-line base64 file: $file_path"
+        local decoded_content=$(decode_base64 "$first_line")
+        if [ $? -eq 0 ] && [ -n "$decoded_content" ]; then
+            echo "$decoded_content" | while IFS= read -r line; do
+                case "$line" in
+                    vless://*|vmess://*|ss://*|trojan://*)
+                        server=$(echo "$line" | sed -n 's/.*@\([^:?]*\)[:?].*/\1/p')
+                        [ -n "$server" ] && echo "$server"
+                        ;;
+                esac
+            done
+        fi
+    # Check if file contains direct proxy URLs
+    elif grep -q "^vless://\|^vmess://\|^ss://\|^trojan://" "$file_path"; then
+        msg "Processing file with direct proxy URLs: $file_path"
+        grep -E "^vless://|^vmess://|^ss://|^trojan://" "$file_path" | while IFS= read -r line; do
+            case "$line" in
+                vless://*|vmess://*|ss://*|trojan://*)
+                    server=$(echo "$line" | sed -n 's/.*@\([^:?]*\)[:?].*/\1/p')
+                    [ -n "$server" ] && echo "$server"
+                    ;;
+            esac
+        done
+    else
+        # Process as regular YAML file
+        msg "Processing YAML file with proxies structure: $file_path"
+        awk '
+        /^proxies:/ { in_proxies = 1; next }
+        /^[a-zA-Z]/ && !/^ / { in_proxies = 0 }
+        in_proxies && /server:/ {
+            gsub(/^[[:space:]]*server:[[:space:]]*/, "")
+            gsub(/[[:space:]]*$/, "")
+            sub(/#.*/, "")
+            if ($0 != "" && $0 != "0.0.0.0") print $0
+        }
+        ' "$file_path"
+    fi
+}
+
+# Function to extract IP addresses from all subscription files
+extract_subscription_ips() {
+    local providers_info
+    local base_dir
+
+    providers_info=$(extract_proxy_providers)
+    if [ -z "$providers_info" ]; then
+        return 0
+    fi
+
+    base_dir=$(get_providers_base_dir)
+
+    echo "$providers_info" | while IFS='|' read -r provider_name path interval; do
+        [ -z "$provider_name" ] && continue
+
+        # Convert relative path to absolute path
+        case "$path" in
+            ./*) full_path="$base_dir/${path#./}" ;;
+            /*) full_path="$path" ;;
+            *) full_path="$base_dir/$path" ;;
+        esac
+
+        if [ -f "$full_path" ]; then
+            local subscription_servers=$(extract_servers_from_subscription "$full_path")
+            if [ -n "$subscription_servers" ]; then
+                echo "$subscription_servers" | while IFS= read -r server; do
+                    [ -z "$server" ] && continue
+                    if is_valid_ip "$server"; then
+                        echo "$server"
+                    else
+                        # Resolve domain to IP addresses
+                        local resolved_ips=$(resolve_domain "$server")
+                        if [ -n "$resolved_ips" ]; then
+                            echo "$resolved_ips"
+                        fi
+                    fi
+                done
+            fi
+        else
+            msg "WARNING: Subscription file not found: $full_path"
+        fi
+    done
+}
+
+# Function to create subscription IP cache with locking
+cache_subscription_ips() {
+    # Check if we have any proxy-providers first
+    local providers_info=$(extract_proxy_providers)
+    if [ -z "$providers_info" ]; then
+        msg "No proxy-providers found, skipping subscription cache"
+        return 0
+    fi
+
+    local lock_timeout=30
+    local lock_acquired=0
+
+    # Try to acquire lock
+    local lock_start=$(date +%s)
+    while [ $lock_acquired -eq 0 ]; do
+        if mkdir "$SUBSCRIPTION_LOCK_FILE" 2>/dev/null; then
+            lock_acquired=1
+            break
+        fi
+
+        local current_time=$(date +%s)
+        if [ $((current_time - lock_start)) -gt $lock_timeout ]; then
+            msg "WARNING: Subscription lock timed out after ${lock_timeout}s, assuming stale lock"
+            # Attempt to remove the stale lock so future invocations are not blocked.
+            if rmdir "$SUBSCRIPTION_LOCK_FILE" 2>/dev/null; then
+                msg "Stale subscription lock removed successfully"
+            else
+                msg "WARNING: Could not remove stale lock at $SUBSCRIPTION_LOCK_FILE — manual cleanup may be required"
+            fi
+            return 1
+        fi
+
+        sleep 1
+    done
+
+    # Create cache
+    local cached_ips=$(extract_subscription_ips)
+    if [ -n "$cached_ips" ]; then
+        echo "$cached_ips" > "$SUBSCRIPTION_CACHE_FILE.tmp"
+        mv "$SUBSCRIPTION_CACHE_FILE.tmp" "$SUBSCRIPTION_CACHE_FILE"
+        msg "Subscription IPs cached successfully"
+    fi
+
+    # Release lock
+    rmdir "$SUBSCRIPTION_LOCK_FILE" 2>/dev/null
+    return 0
+}
+
+# =============================================================================
+# SECTION: Interface detection — LAN/WAN discovery, include/exclude lists
+# =============================================================================
+
+# Function to check if chain exists (iptables only)
+chain_exists() {
+    local table="$1"
+    local chain="$2"
+    iptables -t "$table" -L "$chain" >/dev/null 2>&1
+}
+
+# Function to extract fake-ip configuration from config.yaml
+extract_fake_ip_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 1
+    fi
+
+    # Use awk to parse DNS section and extract both fake-ip-range and fake-ip-filter-mode
+    awk '
+    /^dns:/ { in_dns = 1; next }
+    /^[a-zA-Z]/ && !/^ / { in_dns = 0 }
+    in_dns && /enable:/ {
+        gsub(/^[[:space:]]*enable:[[:space:]]*/, "")
+        gsub(/[[:space:]]*$/, "")
+        sub(/#.*/, "")
+        if ($0 == "true") enable = "true"
+    }
+    in_dns && /enhanced-mode:/ {
+        gsub(/^[[:space:]]*enhanced-mode:[[:space:]]*/, "")
+        gsub(/[[:space:]]*$/, "")
+        sub(/#.*/, "")
+        if ($0 == "fake-ip") mode = "fake-ip"
+    }
+    in_dns && /fake-ip-range:/ {
+        gsub(/^[[:space:]]*fake-ip-range:[[:space:]]*/, "")
+        gsub(/[[:space:]]*$/, "")
+        sub(/#.*/, "")
+        range = $0
+    }
+    in_dns && /fake-ip-filter-mode:/ {
+        gsub(/^[[:space:]]*fake-ip-filter-mode:[[:space:]]*/, "")
+        gsub(/[[:space:]]*$/, "")
+        sub(/#.*/, "")
+        filter_mode = tolower($0)
+    }
+    END {
+        if (enable == "true" && mode == "fake-ip" && range != "") {
+            # Use blacklist as default if filter_mode is not specified
+            print range "|" (filter_mode ? filter_mode : "blacklist")
+        }
+    }
+    ' "$CONFIG_FILE"
+}
+
+# Function to extract server IPs from config.yaml (with subscription support)
+extract_server_ips() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        msg "ERROR: Config file not found: $CONFIG_FILE"
+        return 1
+    fi
+
+    local all_servers=""
+    local subscription_servers=""
+
+    # Extract servers from main proxies section
+    local config_servers=$(awk '
+    /^proxies:/ { in_proxies = 1; next }
+    /^[a-zA-Z]/ && !/^ / { in_proxies = 0 }
+    in_proxies && /server:/ {
+        gsub(/^[[:space:]]*server:[[:space:]]*/, "")
+        gsub(/[[:space:]]*$/, "")
+        sub(/#.*/, "")
+        if ($0 != "") print $0
+    }
+    ' "$CONFIG_FILE")
+
+    # Check if proxy-providers exist before processing subscriptions
+    local providers_exist=$(extract_proxy_providers)
+    if [ -z "$providers_exist" ]; then
+        msg "No proxy-providers configured, using only config servers"
+        subscription_servers=""
+    else
+        # Try to get subscription servers from cache first
+        if [ -f "$SUBSCRIPTION_CACHE_FILE" ]; then
+            # Check if cache file is newer than 1 hour using find
+            if [ -n "$(find "$SUBSCRIPTION_CACHE_FILE" -mmin -60 2>/dev/null)" ]; then
+                subscription_servers=$(cat "$SUBSCRIPTION_CACHE_FILE")
+                msg "Using cached subscription IPs (fresh cache)"
+            else
+                msg "Subscription cache is stale, updating..."
+                subscription_servers=$(extract_subscription_ips)
+                # Update cache
+                if [ -n "$subscription_servers" ]; then
+                    echo "$subscription_servers" > "$SUBSCRIPTION_CACHE_FILE"
+                fi
+            fi
+        else
+            msg "No subscription cache found, extracting subscription IPs..."
+            subscription_servers=$(extract_subscription_ips)
+            # Create cache
+            if [ -n "$subscription_servers" ]; then
+                mkdir -p "$(dirname "$SUBSCRIPTION_CACHE_FILE")"
+                echo "$subscription_servers" > "$SUBSCRIPTION_CACHE_FILE"
+            fi
+        fi
+    fi
+
+    # Combine all servers
+    all_servers="$config_servers"
+    if [ -n "$subscription_servers" ]; then
+        if [ -n "$all_servers" ]; then
+            all_servers="$all_servers
+$subscription_servers"
+        else
+            all_servers="$subscription_servers"
+        fi
+    fi
+
+    # Process each server entry
+    if [ -n "$all_servers" ]; then
+        echo "$all_servers" | while IFS= read -r server; do
+            [ -z "$server" ] && continue
+            if is_valid_ip "$server"; then
+                # It's already an IP address
+                echo "$server"
+            else
+                # It's a domain name, resolve it
+                resolved_ips=$(resolve_domain "$server")
+                if [ -n "$resolved_ips" ]; then
+                    echo "$resolved_ips"
+                else
+                    msg "WARNING: Could not resolve domain: $server"
+                fi
+            fi
+        done | sort -u
+    fi
+}
+
+# Function to get all available interfaces
+get_all_interfaces() {
+    local all_interfaces=""
+
+    # From /sys/class/net
+    if [ -d "/sys/class/net" ]; then
+        for iface_path in /sys/class/net/*; do
+            [ -d "$iface_path" ] || continue
+            local name=$(basename "$iface_path")
+            [ "$name" != "lo" ] || continue
+
+            # Check interface state
+            local operstate=""
+            if [ -f "$iface_path/operstate" ]; then
+                operstate=$(cat "$iface_path/operstate" 2>/dev/null)
+            fi
+
+            # Add active interfaces or bridges
+            if [ "$operstate" = "up" ] || [ -d "$iface_path/bridge" ] || [ -f "$iface_path/brif" ]; then
+                all_interfaces="$all_interfaces $name"
+            fi
+        done
+    fi
+
+    # Via ip link
+    if command -v ip >/dev/null 2>&1; then
+        all_interfaces="$all_interfaces $(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+:/ && !/lo:/ {print $2}' | cut -d'@' -f1)"
+    fi
+
+    # Via brctl (for bridge interfaces)
+    if command -v brctl >/dev/null 2>&1; then
+        all_interfaces="$all_interfaces $(brctl show 2>/dev/null | awk 'NR>1 && $1!="" {print $1}')"
+    fi
+
+    # Remove duplicates and return a space-separated list
+    echo "$all_interfaces" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
+}
+
+# Function to detect LAN bridge
+get_lan_interface() {
+    # Skip if auto-detection is disabled
+    if [ "$AUTO_DETECT_LAN" = "false" ]; then
+        return
+    fi
+
+    # First, try to use saved result
+    if [ -n "$DETECTED_LAN" ] && [ -d "/sys/class/net/$DETECTED_LAN" ]; then
+        msg "Using saved LAN interface: $DETECTED_LAN"
+        echo "$DETECTED_LAN"
+        return 0
+    fi
+
+    # Fallback to detection if saved result is invalid
+    msg "Saved LAN interface not found or invalid, detecting..."
+    local bridge=""
+
+    # Check UCI configuration
+    if command -v uci >/dev/null 2>&1; then
+        local lan_device=$(uci get network.lan.device 2>/dev/null || uci get network.lan.ifname 2>/dev/null)
+        if [ -n "$lan_device" ] && [ -d "/sys/class/net/$lan_device" ]; then
+            bridge="$lan_device"
+            msg "LAN interface detected via UCI: $bridge"
+        fi
+    fi
+
+    # Check all interfaces for bridge with LAN IP
+    if [ -z "$bridge" ]; then
+        for iface in $(get_all_interfaces); do
+            # Check if it's a bridge
+            if [ -d "/sys/class/net/$iface/bridge" ] || [ -d "/sys/class/net/$iface/brif" ]; then
+                # Check IP address
+                local ip=$(ip addr show "$iface" 2>/dev/null | awk '/inet / && !/127\./ {print $2}' | head -1)
+                if [ -n "$ip" ]; then
+                    case "$ip" in
+                        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+                            bridge="$iface"
+                            msg "LAN bridge detected: $bridge (IP: ${ip%/*})"
+                            break
+                            ;;
+                    esac
+                fi
+            fi
+        done
+    fi
+
+    echo "$bridge"
+}
+
+# Function to detect WAN interface
+get_wan_interface() {
+    # Skip if auto-detection is disabled
+    if [ "$AUTO_DETECT_WAN" = "false" ]; then
+        return
+    fi
+
+    # First, try to use saved result
+    if [ -n "$DETECTED_WAN" ] && [ -d "/sys/class/net/$DETECTED_WAN" ]; then
+        msg "Using saved WAN interface: $DETECTED_WAN"
+        echo "$DETECTED_WAN"
+        return 0
+    fi
+
+    # Fallback to detection if saved result is invalid
+    msg "Saved WAN interface not found or invalid, detecting..."
+    local wan_interface=""
+
+    # Get interface through which default route passes
+    wan_interface=$(ip route show default 2>/dev/null | awk '/default via/ {print $5}' | head -1)
+
+    # Check routing table
+    if [ -z "$wan_interface" ]; then
+        wan_interface=$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null)
+    fi
+
+    # Check UCI configuration
+    if [ -z "$wan_interface" ] && command -v uci >/dev/null 2>&1; then
+        wan_interface=$(uci get network.wan.device 2>/dev/null || uci get network.wan.ifname 2>/dev/null)
+    fi
+
+    if [ -n "$wan_interface" ]; then
+        msg "WAN interface detected: $wan_interface"
+    fi
+
+    echo "$wan_interface"
+}
+
+# Function to get interfaces for processing (explicit mode) - with deduplication and clear logging
+get_included_interfaces() {
+    local auto_detected_list=""
+    local user_selected_list=""
+    local combined_list=""
+
+    # Get auto-detected LAN bridge if enabled
+    if [ "$AUTO_DETECT_LAN" = "true" ]; then
+        # The get_lan_interface function already logs what it finds.
+        auto_detected_list=$(get_lan_interface)
+    fi
+
+    # Get user-selected interfaces and log them clearly
+    if [ -n "$INCLUDED_INTERFACES" ]; then
+        # Clean up comma-separated list into a space-separated one
+        user_selected_list=$(echo "$INCLUDED_INTERFACES" | tr ',' ' ' | tr -s ' ' | xargs)
+        if [ -n "$user_selected_list" ]; then
+            msg "User-selected included interfaces: $user_selected_list"
+        fi
+    fi
+
+    # Combine, de-duplicate, and return the final list
+    combined_list="$auto_detected_list $user_selected_list"
+    if [ -z "$combined_list" ]; then
+        msg "ERROR: No interfaces specified for explicit mode"
+        return 1
+    fi
+
+    # Return a clean, unique, newline-separated list
+    echo "$combined_list" | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+# Function to get all interfaces to exclude (exclude mode) - with deduplication and clear logging
+get_excluded_interfaces() {
+    local auto_detected_list=""
+    local user_selected_list=""
+    local combined_list=""
+
+    # Get auto-detected WAN interface if enabled
+    if [ "$AUTO_DETECT_WAN" = "true" ]; then
+        # The get_wan_interface function already logs what it finds.
+        auto_detected_list=$(get_wan_interface)
+    fi
+
+    # Get user-selected interfaces and log them clearly
+    if [ -n "$EXCLUDED_INTERFACES" ]; then
+        # Clean up comma-separated list into a space-separated one
+        user_selected_list=$(echo "$EXCLUDED_INTERFACES" | tr ',' ' ' | tr -s ' ' | xargs)
+        if [ -n "$user_selected_list" ]; then
+            msg "User-selected excluded interfaces: $user_selected_list"
+        fi
+    fi
+
+    # Combine, de-duplicate, and return the final list
+    combined_list="$auto_detected_list $user_selected_list"
+
+    # Return a clean, unique, newline-separated list
+    echo "$combined_list" | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+# For nftables - apply interface exclusion rules in mangle chain
+apply_nft_interface_exclusion_mangle() {
+    local excluded_interfaces="$1"
+    if [ -n "$excluded_interfaces" ]; then
+        msg "Excluded interfaces in mangle: $(echo "$excluded_interfaces" | tr '\n' ' ')"
+        echo "$excluded_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && nft add rule inet clash mangle iifname "$iface" return
+        done
+    fi
+}
+
+# For nftables - apply explicit interface rules in mangle chain
+apply_nft_explicit_interface_mangle() {
+    local included_interfaces
+    included_interfaces=$(get_included_interfaces) || return 1
+    if [ -n "$included_interfaces" ]; then
+        msg "Processing traffic from interfaces: $(echo "$included_interfaces" | tr '\n' ' ')"
+        echo "$included_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && nft add rule inet clash mangle iifname "$iface" jump CLASH_MARK
+        done
+    else
+        return 1
+    fi
+}
+
+# For nftables - apply DHCP exclusion rules in mangle chain
+apply_nft_dhcp_mangle() {
+    # Exclude DHCP traffic (ports 67-68)
+    nft add rule inet clash CLASH_MARK udp sport 67 udp dport 68 return
+    nft add rule inet clash CLASH_MARK udp sport 68 udp dport 67 return
+    msg "DHCP traffic excluded from proxy in mangle"
+}
+
+# For nftables - prevent routing loops with marks in mangle chain
+apply_nft_loop_prevention_mangle() {
+    # Exclude packets already marked by Clash (routing-mark: 2 → 0x0002)
+    nft add rule inet clash CLASH_MARK meta mark 0x0002 return
+    # Exclude packets with any high-byte mark (e.g. connmark restored by other tools)
+    nft add rule inet clash CLASH_MARK meta mark and 0xff00 != 0 return
+    msg "Loop prevention rules applied in mangle"
+}
+
+# For nftables - apply rules for reserved networks in mangle chain
+apply_nft_reserved_networks_mangle() {
+    for network in $RESERVED_NETWORKS; do
+        nft add rule inet clash CLASH_MARK ip daddr "$network" return
+    done
+    msg "Reserved networks excluded from proxy in mangle"
+}
+
+# For nftables - block QUIC traffic in mangle chain
+apply_nft_quic_blocking_mangle() {
+    if [ "$BLOCK_QUIC" = "true" ]; then
+        # Block QUIC traffic (UDP port 443) for improved proxy effectiveness
+        nft add rule inet clash CLASH_MARK udp dport 443 reject
+        msg "QUIC traffic blocked in mangle"
+    else
+        msg "QUIC blocking disabled"
+    fi
+}
+
+# For nftables - exclude Clash process and ports in mangle chain
+apply_nft_clash_exclusions_mangle() {
+    # Exclude specific ports used by Clash
+    nft add rule inet clash CLASH_MARK tcp dport {7890, 7891, 7892, 7893, 7894} return
+    nft add rule inet clash CLASH_MARK udp dport {7890, 7891, 7892, 7893, 7894} return
+    msg "Clash ports excluded from proxy in mangle"
+}
+
+# For nftables - exclude proxy server IPs in mangle chain
+apply_nft_server_exclusions_mangle() {
+    # The set `proxy_servers` is populated in `apply_nft_rules`.
+    # This rule references the set for efficient matching.
+    nft add rule inet clash CLASH_MARK ip daddr @proxy_servers return
+    msg "Proxy server IPs excluded from proxy in mangle via nft set"
+}
+
+# For nftables - apply fake-ip or global marking in mangle chain
+# TPROXY/TUN: both TCP and UDP get mark 0x0001
+# MIXED:      TCP gets 0x0001 (TPROXY → table 100 → lo), UDP gets 0x0003 (TUN → table 101 → clash-tun)
+apply_nft_marking_mangle() {
+    local fake_ip_range="$1"
+    # In MIXED mode UDP uses a separate mark so it can be routed to a different table
+    local udp_mark="0x0001"
+    if [ "$PROXY_MODE" = "mixed" ]; then
+        udp_mark="0x0003"
+    fi
+
+    if [ -n "$fake_ip_range" ]; then
+        nft add rule inet clash CLASH_MARK ip daddr "$fake_ip_range" meta l4proto tcp meta mark set 0x0001 counter
+        nft add rule inet clash CLASH_MARK ip daddr "$fake_ip_range" meta l4proto udp meta mark set "$udp_mark" counter
+        msg "Marking applied only for fake-ip range: $fake_ip_range (UDP mark: $udp_mark)"
+    else
+        nft add rule inet clash CLASH_MARK meta l4proto tcp meta mark set 0x0001 counter
+        nft add rule inet clash CLASH_MARK meta l4proto udp meta mark set "$udp_mark" counter
+        msg "Marking applied for all traffic (UDP mark: $udp_mark)"
+    fi
+    # Additionally mark traffic to fakeip whitelist IP-CIDR entries (whitelist mode only)
+    if [ "$FAKE_IP_FILTER_MODE" = "whitelist" ] && [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+        nft add rule inet clash CLASH_MARK ip daddr @fakeip_whitelist meta l4proto tcp meta mark set 0x0001 counter
+        nft add rule inet clash CLASH_MARK ip daddr @fakeip_whitelist meta l4proto udp meta mark set "$udp_mark" counter
+        msg "Marking also applied for fakeip whitelist IP-CIDR nft set (UDP mark: $udp_mark)"
+    fi
+}
+
+# For nftables - apply TPROXY rules in proxy chain (mode-aware)
+# TPROXY:  TCP+UDP both redirected via TPROXY port 7894
+# MIXED:   TCP only redirected via TPROXY (mark 0x0001); UDP routed to clash-tun by fwmark 0x0003
+# TUN:     no TPROXY; all traffic routed to clash-tun by kernel via fwmark 0x0001
+apply_nft_tproxy_proxy() {
+    case "$PROXY_MODE" in
+        "tun")
+            msg "TPROXY rules skipped (TUN mode - all traffic routes via clash-tun)"
+            ;;
+        "mixed")
+            nft add rule inet clash proxy meta mark 0x0001 meta l4proto tcp tproxy ip to 127.0.0.1:7894 counter
+            msg "TPROXY rules applied for TCP only (MIXED mode)"
+            ;;
+        *)
+            nft add rule inet clash proxy meta mark 0x0001 meta l4proto tcp tproxy ip to 127.0.0.1:7894 counter
+            nft add rule inet clash proxy meta mark 0x0001 meta l4proto udp tproxy ip to 127.0.0.1:7894 counter
+            msg "TPROXY rules applied for TCP and UDP (TPROXY mode)"
+            ;;
+    esac
+}
+
+# For nftables - allow forwarding to/from clash-tun (TUN/MIXED mode)
+# Injects accept rules at the top of inet fw4 forward chain so that traffic
+# forwarded between LAN and clash-tun is not dropped by the zone-based firewall.
+# Falls back to an inet clash forward base chain when fw4 is absent.
+apply_nft_tun_forward_rules() {
+    case "$PROXY_MODE" in
+        "tun"|"mixed") ;;
+        *) return 0 ;;
+    esac
+
+    if nft list table inet fw4 >/dev/null 2>&1; then
+        nft insert rule inet fw4 forward iifname "clash-tun" accept comment "ssclash-fwd" 2>/dev/null
+        nft insert rule inet fw4 forward oifname "clash-tun" accept comment "ssclash-fwd" 2>/dev/null
+        msg "Inserted clash-tun forward rules into inet fw4 (TUN/MIXED mode)"
+    else
+        # No fw4 table — add a standalone forward base chain in our own table
+        nft add chain inet clash forward '{ type filter hook forward priority -1; policy accept; }' 2>/dev/null
+        nft add rule inet clash forward iifname "clash-tun" accept 2>/dev/null
+        nft add rule inet clash forward oifname "clash-tun" accept 2>/dev/null
+        msg "Added clash-tun forward rules in inet clash (no fw4 found)"
+    fi
+}
+
+# For nftables - remove the forward rules added by apply_nft_tun_forward_rules
+teardown_nft_tun_forward_rules() {
+    # Remove rules injected into inet fw4 forward (identified by comment)
+    if nft list table inet fw4 >/dev/null 2>&1; then
+        nft -a list chain inet fw4 forward 2>/dev/null \
+            | awk '/ssclash-fwd/ { for(i=1;i<=NF;i++) if($i=="handle") { print $(i+1); break } }' \
+            | while IFS= read -r handle; do
+                [ -n "$handle" ] && nft delete rule inet fw4 forward handle "$handle" 2>/dev/null
+              done
+        msg "Removed clash-tun forward rules from inet fw4"
+    fi
+    # The inet clash table (including any forward chain we may have added) is
+    # deleted wholesale by the nft delete table inet clash call in stop(), so
+    # no extra cleanup is needed here for the fallback path.
+}
+
+# For nftables - apply interface exclusion rules in output chain
+apply_nft_interface_exclusion_output() {
+    local excluded_interfaces="$1"
+    if [ -n "$excluded_interfaces" ]; then
+        msg "Excluded interfaces in output: $(echo "$excluded_interfaces" | tr '\n' ' ')"
+        echo "$excluded_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && nft add rule inet clash output oifname "$iface" return
+        done
+    fi
+}
+
+# For nftables - exclude Clash process and ports in output chain
+apply_nft_clash_exclusions_output() {
+    # Exclude Clash process itself (by user ID if available)
+    nft add rule inet clash output meta skuid 0 return
+    # Exclude specific ports used by Clash
+    nft add rule inet clash output tcp sport {7890, 7891, 7892, 7893, 7894} return
+    nft add rule inet clash output udp sport {7890, 7891, 7892, 7893, 7894} return
+    msg "Clash process and ports excluded from proxy in output"
+}
+
+# For nftables - apply output chain rules
+apply_nft_output_rules() {
+    local server_ips="$1"
+    local excluded_interfaces="$2"
+    local fake_ip_filter_mode="$3"
+    local fake_ip_range="$4"
+
+    # Apply interface exclusions for output traffic
+    apply_nft_interface_exclusion_output "$excluded_interfaces"
+
+    # Exclude already marked packets
+    nft add rule inet clash output meta mark 0x0002 return
+    nft add rule inet clash output meta mark and 0xff00 != 0 return
+
+    # Skip exclusion rules in whitelist mode
+    if [ "$fake_ip_filter_mode" != "whitelist" ]; then
+        # Exclude DHCP traffic
+        nft add rule inet clash output udp sport 67 udp dport 68 return
+        nft add rule inet clash output udp sport 68 udp dport 67 return
+
+        # Apply exclusions for reserved networks
+        for network in $RESERVED_NETWORKS; do
+            nft add rule inet clash output ip daddr "$network" return
+            nft add rule inet clash output ip saddr "$network" return
+        done
+
+        # Apply server exclusions if provided
+        if [ -n "$server_ips" ]; then
+            nft add rule inet clash output ip saddr @proxy_servers return
+            nft add rule inet clash output ip daddr @proxy_servers return
+        fi
+    fi
+
+    # Apply Clash exclusions
+    apply_nft_clash_exclusions_output
+
+    # In MIXED mode router-originated UDP must use the TUN mark (0x0003 → table 101 → clash-tun)
+    local output_udp_mark="0x0001"
+    if [ "$PROXY_MODE" = "mixed" ]; then
+        output_udp_mark="0x0003"
+    fi
+
+    if [ -n "$fake_ip_range" ]; then
+        nft add rule inet clash output ip daddr "$fake_ip_range" meta l4proto tcp meta mark set 0x0001 counter
+        nft add rule inet clash output ip daddr "$fake_ip_range" meta l4proto udp meta mark set "$output_udp_mark" counter
+        msg "OUTPUT: Marking applied only for fake-ip range: $fake_ip_range"
+    else
+        nft add rule inet clash output meta mark 0 meta l4proto tcp meta mark set 0x0001
+        nft add rule inet clash output meta mark 0 meta l4proto udp meta mark set "$output_udp_mark"
+        msg "OUTPUT: Marking applied for all traffic"
+    fi
+    # Additionally mark locally generated traffic to fakeip whitelist IP-CIDR entries
+    if [ "$fake_ip_filter_mode" = "whitelist" ] && [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+        nft add rule inet clash output ip daddr @fakeip_whitelist meta l4proto tcp meta mark set 0x0001 counter
+        nft add rule inet clash output ip daddr @fakeip_whitelist meta l4proto udp meta mark set "$output_udp_mark" counter
+        msg "OUTPUT: Marking also applied for fakeip whitelist IP-CIDR nft set"
+    fi
+
+    msg "Output chain rules applied"
+}
+
+# For iptables - apply explicit interface rules
+apply_iptables_explicit_interface_rules() {
+    local included_interfaces
+    included_interfaces=$(get_included_interfaces) || return 1
+    if [ -n "$included_interfaces" ]; then
+        msg "Processing traffic from interfaces: $(echo "$included_interfaces" | tr '\n' ' ')"
+        echo "$included_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && iptables -t mangle -A CLASH -i "$iface" -j CLASH_PROCESS
+        done
+    else
+        return 1
+    fi
+}
+
+# For iptables - apply exclude interface rules to prevent routing loops
+apply_iptables_exclude_interface_rules() {
+    local excluded_interfaces="$1"
+    if [ -n "$excluded_interfaces" ]; then
+        msg "Excluded interfaces: $(echo "$excluded_interfaces" | tr '\n' ' ')"
+        echo "$excluded_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && iptables -t mangle -A CLASH -i "$iface" -j RETURN
+        done
+    else
+        msg "No excluded interfaces found"
+    fi
+}
+
+# For iptables - apply DHCP exclusion rules
+apply_iptables_dhcp_rules() {
+    if chain_exists "mangle" "CLASH_PROCESS"; then
+        iptables -t mangle -I CLASH_PROCESS 1 -p udp --sport 67 --dport 68 -j RETURN
+        iptables -t mangle -I CLASH_PROCESS 1 -p udp --sport 68 --dport 67 -j RETURN
+        msg "DHCP traffic excluded from proxy"
+    fi
+}
+
+# For iptables - prevent routing loops with marks
+apply_iptables_loop_prevention() {
+    # Exclude packets already marked by Clash (routing-mark: 2 → 0x0002)
+    iptables -t mangle -A CLASH_PROCESS -m mark --mark 0x0002 -j RETURN
+    # Exclude packets with any high-byte mark (e.g. connmark restored by other tools)
+    iptables -t mangle -A CLASH_PROCESS -m mark --mark 0xff00/0xff00 -j RETURN
+    msg "Loop prevention rules applied"
+}
+
+# For iptables - apply rules for reserved networks
+apply_iptables_reserved_networks() {
+    for network in $RESERVED_NETWORKS; do
+        iptables -t mangle -A CLASH_PROCESS -d "$network" -j RETURN
+    done
+    msg "Reserved networks excluded from proxy (only destination)"
+}
+
+# For iptables - block QUIC traffic
+apply_iptables_quic_blocking() {
+    if [ "$BLOCK_QUIC" = "true" ]; then
+        iptables -t filter -I INPUT -p udp --dport 443 -j REJECT 2>/dev/null
+        iptables -t filter -I FORWARD -p udp --dport 443 -j REJECT 2>/dev/null
+        msg "QUIC traffic blocked"
+    else
+        msg "QUIC blocking disabled"
+    fi
+}
+
+# For iptables - exclude Clash ports
+apply_iptables_clash_exclusions() {
+    iptables -t mangle -A CLASH_PROCESS -p tcp --dport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_PROCESS -p udp --dport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_PROCESS -p tcp --sport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_PROCESS -p udp --sport 7890:7894 -j RETURN
+    msg "Clash ports excluded from proxy"
+}
+
+# For iptables - exclude proxy server IPs
+apply_iptables_server_exclusions() {
+    local server_ips="$1"
+    if [ -n "$server_ips" ]; then
+        echo "$server_ips" | while IFS= read -r ip; do
+            [ -n "$ip" ] && {
+                iptables -t mangle -A CLASH_PROCESS -d "$ip/32" -j RETURN
+                iptables -t mangle -A CLASH_PROCESS -s "$ip/32" -j RETURN
+            }
+        done
+        msg "Proxy server IPs excluded from proxy"
+    else
+        msg "No proxy server IPs to exclude"
+    fi
+}
+
+# For iptables - apply traffic redirection rules (mode-aware)
+# TPROXY:  TCP+UDP both redirected via TPROXY port 7894
+# MIXED:   TCP → TPROXY mark 0x0001; UDP → mark 0x0003 for routing to clash-tun (table 101)
+# TUN:     TCP+UDP both marked 0x0001 for routing to clash-tun (table 100)
+apply_iptables_tproxy_rules() {
+    local fake_ip_range="$1"
+    case "$PROXY_MODE" in
+        "tun")
+            if [ -n "$fake_ip_range" ]; then
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p tcp -j MARK --set-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p udp -j MARK --set-mark 0x0001
+                msg "TUN mark rules applied for fake-ip range: $fake_ip_range"
+            else
+                iptables -t mangle -A CLASH_PROCESS -p tcp -j MARK --set-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -p udp -j MARK --set-mark 0x0001
+                msg "TUN mark rules applied for all traffic (via clash-tun)"
+            fi
+            ;;
+        "mixed")
+            if [ -n "$fake_ip_range" ]; then
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p udp -j MARK --set-mark 0x0003
+                msg "MIXED rules applied for fake-ip range: $fake_ip_range (TCP TPROXY, UDP TUN mark 0x0003)"
+            else
+                iptables -t mangle -A CLASH_PROCESS -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -p udp -j MARK --set-mark 0x0003
+                msg "MIXED rules applied for all traffic (TCP TPROXY, UDP TUN mark 0x0003)"
+            fi
+            ;;
+        *)
+            if [ -n "$fake_ip_range" ]; then
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -d "$fake_ip_range" -p udp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                msg "TPROXY rules applied only for fake-ip range: $fake_ip_range"
+            else
+                iptables -t mangle -A CLASH_PROCESS -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -p udp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                msg "TPROXY rules applied for all traffic"
+            fi
+            ;;
+    esac
+    # Add ipset-based rules for fakeip whitelist IP-CIDR entries (whitelist mode only)
+    if [ "$FAKE_IP_FILTER_MODE" = "whitelist" ] && [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+        case "$PROXY_MODE" in
+            "tun")
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p tcp -j MARK --set-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p udp -j MARK --set-mark 0x0001
+                msg "TUN: fakeip whitelist ipset rules applied"
+                ;;
+            "mixed")
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p udp -j MARK --set-mark 0x0003
+                msg "MIXED: fakeip whitelist ipset rules applied"
+                ;;
+            *)
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                iptables -t mangle -A CLASH_PROCESS -m set --match-set "$FAKEIP_IPSET_NAME" dst -p udp -j TPROXY --on-ip 127.0.0.1 --on-port 7894 --tproxy-mark 0x0001
+                msg "TPROXY: fakeip whitelist ipset rules applied"
+                ;;
+        esac
+    fi
+}
+
+# For iptables - apply interface exclusion rules in output chain
+apply_iptables_interface_exclusion_output() {
+    local excluded_interfaces="$1"
+    if [ -n "$excluded_interfaces" ]; then
+        msg "Excluded interfaces in output (iptables): $(echo "$excluded_interfaces" | tr '\n' ' ')"
+        echo "$excluded_interfaces" | while IFS= read -r iface; do
+            [ -n "$iface" ] && iptables -t mangle -I CLASH_LOCAL 1 -o "$iface" -j RETURN
+        done
+    fi
+}
+
+# For iptables - apply output chain rules
+apply_iptables_output_rules() {
+    local server_ips="$1"
+    local excluded_interfaces="$2"
+    local fake_ip_filter_mode="$3"
+    local fake_ip_range="$4"
+
+    # Apply interface exclusions for output traffic
+    apply_iptables_interface_exclusion_output "$excluded_interfaces"
+
+    # Exclude already marked packets
+    iptables -t mangle -A CLASH_LOCAL -m mark --mark 0x0002 -j RETURN
+    iptables -t mangle -A CLASH_LOCAL -m mark --mark 0xff00/0xff00 -j RETURN
+
+    # Skip exclusion rules in whitelist mode
+    if [ "$fake_ip_filter_mode" != "whitelist" ]; then
+        # Exclude DHCP traffic
+        iptables -t mangle -I CLASH_LOCAL 1 -p udp --sport 67 --dport 68 -j RETURN
+        iptables -t mangle -I CLASH_LOCAL 1 -p udp --sport 68 --dport 67 -j RETURN
+
+        # Apply exclusions for reserved networks
+        for network in $RESERVED_NETWORKS; do
+            iptables -t mangle -A CLASH_LOCAL -d "$network" -j RETURN
+            iptables -t mangle -A CLASH_LOCAL -s "$network" -j RETURN
+        done
+
+        # Apply server exclusions if provided
+        if [ -n "$server_ips" ]; then
+            echo "$server_ips" | while IFS= read -r ip; do
+                [ -n "$ip" ] && {
+                    iptables -t mangle -A CLASH_LOCAL -d "$ip/32" -j RETURN
+                    iptables -t mangle -A CLASH_LOCAL -s "$ip/32" -j RETURN
+                }
+            done
+        fi
+    fi
+
+    # Exclude Clash process and ports
+    iptables -t mangle -A CLASH_LOCAL -p tcp --dport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_LOCAL -p udp --dport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_LOCAL -p tcp --sport 7890:7894 -j RETURN
+    iptables -t mangle -A CLASH_LOCAL -p udp --sport 7890:7894 -j RETURN
+
+    # In MIXED mode router-originated UDP uses TUN mark (0x0003 → table 101 → clash-tun)
+    local ipt_output_udp_mark="0x0001"
+    if [ "$PROXY_MODE" = "mixed" ]; then
+        ipt_output_udp_mark="0x0003"
+    fi
+
+    if [ -n "$fake_ip_range" ]; then
+        iptables -t mangle -A CLASH_LOCAL -m mark --mark 0 -p tcp -d "$fake_ip_range" -j MARK --set-mark 0x0001
+        iptables -t mangle -A CLASH_LOCAL -m mark --mark 0 -p udp -d "$fake_ip_range" -j MARK --set-mark "$ipt_output_udp_mark"
+        msg "OUTPUT: Marking applied only for fake-ip range: $fake_ip_range"
+    else
+        iptables -t mangle -A CLASH_LOCAL -m mark --mark 0 -p tcp -j MARK --set-mark 0x0001
+        iptables -t mangle -A CLASH_LOCAL -m mark --mark 0 -p udp -j MARK --set-mark "$ipt_output_udp_mark"
+        msg "OUTPUT: Marking applied for all traffic"
+    fi
+    # Additionally mark locally generated traffic to fakeip whitelist IP-CIDR entries
+    if [ "$fake_ip_filter_mode" = "whitelist" ] && [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+        iptables -t mangle -A CLASH_LOCAL -m set --match-set "$FAKEIP_IPSET_NAME" dst -p tcp -j MARK --set-mark 0x0001
+        iptables -t mangle -A CLASH_LOCAL -m set --match-set "$FAKEIP_IPSET_NAME" dst -p udp -j MARK --set-mark "$ipt_output_udp_mark"
+        msg "OUTPUT: fakeip whitelist ipset rules applied"
+    fi
+
+    msg "Output chain rules applied"
+}
+
+# For iptables - allow forwarding to/from clash-tun (TUN/MIXED mode)
+# Inserts accept rules at the top of the filter FORWARD chain so that traffic
+# forwarded between LAN and clash-tun is not dropped by fw3/iptables rules.
+apply_iptables_tun_forward_rules() {
+    case "$PROXY_MODE" in
+        "tun"|"mixed") ;;
+        *) return 0 ;;
+    esac
+
+    iptables -t filter -I FORWARD 1 -i clash-tun -j ACCEPT 2>/dev/null
+    iptables -t filter -I FORWARD 1 -o clash-tun -j ACCEPT 2>/dev/null
+    msg "Inserted clash-tun FORWARD rules (iptables, TUN/MIXED mode)"
+}
+
+# For iptables - remove the FORWARD rules added by apply_iptables_tun_forward_rules
+teardown_iptables_tun_forward_rules() {
+    iptables -t filter -D FORWARD -i clash-tun -j ACCEPT 2>/dev/null
+    iptables -t filter -D FORWARD -o clash-tun -j ACCEPT 2>/dev/null
+    msg "Removed clash-tun FORWARD rules (iptables)"
+}
+
+# Apply nftables rules dynamically
+# =============================================================================
+# SECTION: Firewall rules — nftables and iptables implementations
+# =============================================================================
+
+apply_nft_rules() {
+    local server_ips="$1"
+    local fake_ip_range="$2"
+    local fake_ip_filter_mode="$3"
+
+    nft delete table inet clash 2>/dev/null
+
+    # Create table and chains with two-stage approach and proper priority ordering:
+    # Stage 1: Mangle chain (priority -150) - interface filtering, exclusions, and packet marking
+    # Stage 2: Proxy chain (priority -100) - TPROXY redirection for marked packets
+    # Output chain (priority mangle) - handle locally generated traffic
+    nft add table inet clash
+    nft add chain inet clash mangle '{ type filter hook prerouting priority -150; policy accept; }'
+    nft add chain inet clash proxy '{ type filter hook prerouting priority -100; policy accept; }'
+    nft add chain inet clash output '{ type route hook output priority mangle; policy accept; }'
+    nft add chain inet clash CLASH_MARK
+
+    # Exclude forwarded traffic (DNAT) from TPROXY to prevent conflicts.
+    # This ensures that incoming connections for port forwarding are not hijacked
+    # by the transparent proxy and can reach their internal destination.
+    nft add rule inet clash mangle ct status dnat return
+    msg "DNAT traffic exclusion rule applied"
+
+    # Create a named set for proxy server IPs for efficient management
+    nft add set inet clash proxy_servers '{ type ipv4_addr; flags interval; auto-merge; }'
+    # Populate the set with server IPs
+    if [ -n "$server_ips" ]; then
+        local nft_elements=$(echo "$server_ips" | tr '\n' ',' | sed 's/,$//')
+        nft add element inet clash proxy_servers "{ $nft_elements }"
+        msg "Populated proxy_servers set with $(echo "$server_ips" | wc -l | xargs) IPs."
+    fi
+
+    # Create nft set for fakeip whitelist IP-CIDR entries (always created so rules can reference it)
+    nft add set inet clash fakeip_whitelist '{ type ipv4_addr; flags interval; auto-merge; }'
+    if [ "$fake_ip_filter_mode" = "whitelist" ] && [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+        local nft_wl_elements=$(echo "$FAKEIP_WHITELIST_IPS" | tr '\n' ',' | sed 's/,$//')
+        nft add element inet clash fakeip_whitelist "{ $nft_wl_elements }"
+        msg "Populated fakeip_whitelist nft set with $(echo "$FAKEIP_WHITELIST_IPS" | wc -l | xargs) entries."
+    fi
+
+    case "$MODE" in
+        "explicit")
+            apply_nft_explicit_interface_mangle || return 1
+            ;;
+        *) # exclude mode
+            local excluded_interfaces=$(get_excluded_interfaces)
+            apply_nft_interface_exclusion_mangle "$excluded_interfaces"
+            nft add rule inet clash mangle jump CLASH_MARK
+
+            # In exclude mode, we also need to process locally generated traffic
+            apply_nft_output_rules "$server_ips" "$excluded_interfaces" "$fake_ip_filter_mode" "$fake_ip_range"
+            msg "nftables output rules applied (exclude mode)"
+            ;;
+    esac
+
+    # Apply common exclusion and marking rules
+    apply_nft_loop_prevention_mangle
+    apply_nft_clash_exclusions_mangle
+    apply_nft_quic_blocking_mangle
+
+    # Skip exclusion rules in whitelist mode
+    if [ "$fake_ip_filter_mode" != "whitelist" ]; then
+        apply_nft_dhcp_mangle
+        apply_nft_reserved_networks_mangle
+        apply_nft_server_exclusions_mangle
+        msg "Full exclusion rules applied"
+    else
+        msg "Minimal exclusion rules applied (fake-ip-filter-mode: whitelist - only system protection)"
+    fi
+
+    apply_nft_marking_mangle "$fake_ip_range"
+
+    # Apply TPROXY rules
+    apply_nft_tproxy_proxy
+
+    # Allow forwarding between LAN and clash-tun in TUN/MIXED mode
+    apply_nft_tun_forward_rules
+
+    msg "nftables rules applied successfully"
+}
+
+# Apply iptables rules dynamically
+apply_iptables_rules() {
+    local server_ips="$1"
+    local fake_ip_range="$2"
+    local fake_ip_filter_mode="$3"
+
+    # Create all chains first before applying any rules
+    iptables -t mangle -N CLASH 2>/dev/null
+    iptables -t mangle -N CLASH_LOCAL 2>/dev/null
+    iptables -t mangle -N CLASH_PROCESS 2>/dev/null
+
+    # Set up fakeip whitelist ipset so that rules referencing it by name always succeed
+    if [ "$fake_ip_filter_mode" = "whitelist" ] && hash ipset 2>/dev/null; then
+        ensure_fakeip_ipset && populate_fakeip_ipset_from_file
+    fi
+
+    # Exclude forwarded traffic (DNAT) from TPROXY to prevent conflicts.
+    # This ensures that incoming connections for port forwarding are not hijacked
+    # by the transparent proxy and can reach their internal destination.
+    iptables -t mangle -I CLASH 1 -m conntrack --ctstate DNAT -j RETURN
+    msg "DNAT traffic exclusion rule applied"
+
+    # Apply rules based on the operation mode
+    case "$MODE" in
+        "explicit")
+            apply_iptables_explicit_interface_rules || return 1
+            ;;
+        *) # exclude mode
+            local excluded_interfaces=$(get_excluded_interfaces)
+            apply_iptables_exclude_interface_rules "$excluded_interfaces"
+            iptables -t mangle -A CLASH -j CLASH_PROCESS
+
+            # In exclude mode, we also need to process locally generated traffic
+            apply_iptables_output_rules "$server_ips" "$excluded_interfaces" "$fake_ip_filter_mode" "$fake_ip_range"
+            msg "iptables output rules applied (exclude mode)"
+            ;;
+    esac
+
+    # Apply common exclusion and marking rules
+    apply_iptables_loop_prevention
+    apply_iptables_clash_exclusions
+    apply_iptables_quic_blocking
+
+    # Skip exclusion rules in whitelist mode
+    if [ "$fake_ip_filter_mode" != "whitelist" ]; then
+        apply_iptables_dhcp_rules
+        apply_iptables_reserved_networks
+        apply_iptables_server_exclusions "$server_ips"
+        msg "Full exclusion rules applied"
+    else
+        msg "Minimal exclusion rules applied (fake-ip-filter-mode: whitelist - only system protection)"
+    fi
+
+    apply_iptables_tproxy_rules "$fake_ip_range"
+
+    # Allow forwarding between LAN and clash-tun in TUN/MIXED mode
+    apply_iptables_tun_forward_rules
+
+    # Hook the main chains into the system. This is the entry point.
+    iptables -t mangle -A PREROUTING -j CLASH
+    if [ "$MODE" != "explicit" ]; then
+        iptables -t mangle -A OUTPUT -j CLASH_LOCAL
+        msg "iptables rules applied successfully (exclude mode with output processing)"
+    else
+        msg "iptables rules applied successfully (explicit mode without output processing)"
+    fi
+}
+
+# This function intelligently updates subscription IPs without a full script restart
+# =============================================================================
+# SECTION: Rule update — refresh subscription cache and rebuild firewall rules
+# =============================================================================
+
+update_rules() {
+    msg "Intelligently updating subscription IPs..."
+
+    local old_ips=""
+    if [ -f "$SUBSCRIPTION_CACHE_FILE" ]; then
+        old_ips=$(cat "$SUBSCRIPTION_CACHE_FILE")
+    fi
+
+    # This function updates the cache and returns 0 on success
+    cache_subscription_ips
+    if [ $? -ne 0 ]; then
+        msg "ERROR: Failed to update subscription cache. Aborting update."
+        return 1
+    fi
+
+    local new_ips=""
+    if [ -f "$SUBSCRIPTION_CACHE_FILE" ]; then
+        new_ips=$(cat "$SUBSCRIPTION_CACHE_FILE")
+    fi
+
+    if [ "$old_ips" = "$new_ips" ]; then
+        msg "Subscription IPs unchanged, no update needed."
+        return 0
+    fi
+
+    msg "Subscription IPs have changed. Applying delta update."
+
+    if hash nft 2>/dev/null && nft list set inet clash proxy_servers >/dev/null 2>&1; then
+        # For nftables, simply flush the set and add all new IPs.
+        # This is atomic and much faster than comparing IPs.
+        msg "Updating nftables proxy_servers set..."
+        nft flush set inet clash proxy_servers
+        if [ -n "$new_ips" ]; then
+            # Format IPs for nft: { ip1, ip2, ip3 }
+            local nft_elements=$(echo "$new_ips" | tr '\n' ',' | sed 's/,$//')
+            nft add element inet clash proxy_servers "{ $nft_elements }"
+            msg "Updated proxy_servers set with $(echo "$new_ips" | wc -l | xargs) IPs."
+        else
+            msg "No subscription IPs to add to the set."
+        fi
+    elif hash iptables 2>/dev/null; then
+        # For iptables, find the difference and apply changes incrementally.
+        # Create temporary files for comparison
+        local old_sorted="/tmp/clash/clash_old_ips.$$"
+        local new_sorted="/tmp/clash/clash_new_ips.$$"
+
+        echo "$old_ips" | sort -u > "$old_sorted"
+        echo "$new_ips" | sort -u > "$new_sorted"
+
+        local ips_to_remove=$(comm -23 "$old_sorted" "$new_sorted")
+        local ips_to_add=$(comm -13 "$old_sorted" "$new_sorted")
+
+        # Clean up temporary files
+        rm -f "$old_sorted" "$new_sorted"
+
+        msg "Updating iptables rules..."
+
+        if [ -n "$ips_to_remove" ]; then
+            echo "$ips_to_remove" | while IFS= read -r ip; do
+                [ -z "$ip" ] && continue
+                iptables -t mangle -D CLASH_PROCESS -d "$ip/32" -j RETURN 2>/dev/null
+                iptables -t mangle -D CLASH_PROCESS -s "$ip/32" -j RETURN 2>/dev/null
+                iptables -t mangle -D CLASH_LOCAL -d "$ip/32" -j RETURN 2>/dev/null
+                iptables -t mangle -D CLASH_LOCAL -s "$ip/32" -j RETURN 2>/dev/null
+            done
+            msg "Removed $(echo "$ips_to_remove" | wc -l | xargs) old IP rules."
+        fi
+
+        if [ -n "$ips_to_add" ]; then
+            echo "$ips_to_add" | while IFS= read -r ip; do
+                [ -z "$ip" ] && continue
+                iptables -t mangle -A CLASH_PROCESS -d "$ip/32" -j RETURN
+                iptables -t mangle -A CLASH_PROCESS -s "$ip/32" -j RETURN
+                iptables -t mangle -A CLASH_LOCAL -d "$ip/32" -j RETURN
+                iptables -t mangle -A CLASH_LOCAL -s "$ip/32" -j RETURN
+            done
+            msg "Added $(echo "$ips_to_add" | wc -l | xargs) new IP rules."
+        fi
+        msg "iptables rules updated successfully."
+    else
+        # If no supported method is found, fall back to the old behavior.
+        msg "No active rules found or update method not supported. Falling back to full restart."
+        stop && start
+    fi
+}
+
+# Set up ip route/ip rule entries based on PROXY_MODE
+# TPROXY:  fwmark 0x0001 → table 100 → lo  (kernel delivers to TPROXY socket)
+# TUN:     fwmark 0x0001 → table 100 → clash-tun (route set here if already up, else by service_started)
+# MIXED:   fwmark 0x0001 → table 100 → lo  (TCP TPROXY)
+#          fwmark 0x0003 → table 101 → clash-tun (UDP TUN; route set here if already up, else by service_started)
+# =============================================================================
+# SECTION: Policy routing — ip rule / ip route tables for tproxy/tun/mixed
+# =============================================================================
+
+setup_routing_rules() {
+    case "$PROXY_MODE" in
+        "tun")
+            ip rule add fwmark 0x0001 table 100 2>/dev/null
+            # Best-effort for restart (clash-tun already up); on fresh start the daemon below sets it.
+            ip route replace default dev clash-tun table 100 2>/dev/null
+            msg "Routing: fwmark 0x0001 → table 100 → clash-tun (TUN mode)"
+            _spawn_tun_route_daemon 100
+            ;;
+        "mixed")
+            ip route add local default dev lo table 100 2>/dev/null
+            ip rule add fwmark 0x0001 table 100 2>/dev/null
+            ip rule add fwmark 0x0003 table 101 2>/dev/null
+            # Best-effort for restart (clash-tun already up); on fresh start the daemon below sets it.
+            ip route replace default dev clash-tun table 101 2>/dev/null
+            msg "Routing: TCP fwmark 0x0001 → table 100 → lo (TPROXY), UDP fwmark 0x0003 → table 101 → clash-tun (MIXED mode)"
+            _spawn_tun_route_daemon 101
+            ;;
+        *)
+            ip route add local default dev lo table 100 2>/dev/null
+            ip rule add fwmark 0x0001 table 100 2>/dev/null
+            msg "Routing: fwmark 0x0001 → table 100 → lo (TPROXY mode)"
+            ;;
+    esac
+}
+
+# Double-fork a lightweight daemon that waits for clash-tun and adds the default
+# route in the given policy-routing table.  The double-fork detaches the inner
+# process from both clash-rules and the calling init.d shell: when the outer
+# subshell exits its child is reparented to PID 1 (init) and cannot be killed
+# by anything in the init.d lifecycle.
+_spawn_tun_route_daemon() {
+    local table="$1"
+    # Fast path: interface already exists (e.g. service restart with mihomo still running)
+    if [ -d "/sys/class/net/clash-tun" ]; then
+        ip route replace default dev clash-tun table "$table" 2>/dev/null && \
+            msg "TUN route set immediately: clash-tun → table $table" && return 0
+    fi
+    # Slow path: mihomo hasn't created clash-tun yet — daemonise a watcher.
+    # Outer subshell exits right after forking the inner one, so the inner
+    # process is adopted by init and outlives init.d / clash-rules.
+    (
+        (
+            exec < /dev/null > /dev/null 2>&1
+            t=0
+            while [ "$t" -lt 30 ]; do
+                if [ -d "/sys/class/net/clash-tun" ]; then
+                    ip route replace default dev clash-tun table "$table"
+                    logger -p daemon.info -t ssclash \
+                        "TUN route daemon: clash-tun → table $table (after ${t}s)"
+                    exit 0
+                fi
+                sleep 1
+                t=$((t + 1))
+            done
+            logger -p daemon.warn -t ssclash \
+                "TUN route daemon: clash-tun not found after 30s (table $table)"
+        ) &
+    ) &
+}
+
+# Remove all possible routing entries created by setup_routing_rules.
+# Cleans up all modes unconditionally (safe: errors suppressed)
+# so that stop() works correctly even if PROXY_MODE changed since start.
+teardown_routing_rules() {
+    ip route del local default dev lo table 100 2>/dev/null
+    ip route del default dev clash-tun table 100 2>/dev/null
+    ip route del default dev clash-tun table 101 2>/dev/null
+    ip rule del fwmark 0x0001 table 100 2>/dev/null
+    ip rule del fwmark 0x0003 table 101 2>/dev/null
+}
+
+# Atomically refresh the fakeip whitelist IP-CIDR set contents (nft set or ipset)
+# without restarting mihomo or rebuilding firewall chains.
+# =============================================================================
+# SECTION: Fake-IP whitelist — ipset/nft set management for CIDR exclusions
+# =============================================================================
+
+update_fakeip_whitelist_sets() {
+    msg "Updating fakeip whitelist IP-CIDR sets..."
+    load_all_settings_once
+
+    local fake_ip_config fake_ip_range fake_ip_filter_mode
+    fake_ip_config=$(extract_fake_ip_config)
+    if [ -n "$fake_ip_config" ]; then
+        fake_ip_range="${fake_ip_config%|*}"
+        fake_ip_filter_mode="${fake_ip_config#*|}"
+    fi
+
+    if [ "$fake_ip_filter_mode" != "whitelist" ]; then
+        msg "fake-ip-filter-mode is '${fake_ip_filter_mode:-blacklist}', not 'whitelist' — clearing fakeip sets if they exist"
+        if hash nft 2>/dev/null && nft list set inet clash fakeip_whitelist >/dev/null 2>&1; then
+            nft flush set inet clash fakeip_whitelist 2>/dev/null
+            msg "nft fakeip_whitelist set cleared"
+        fi
+        if hash ipset 2>/dev/null && ipset list "$FAKEIP_IPSET_NAME" >/dev/null 2>&1; then
+            ipset flush "$FAKEIP_IPSET_NAME" 2>/dev/null
+            msg "ipset $FAKEIP_IPSET_NAME cleared"
+        fi
+        return 0
+    fi
+
+    FAKEIP_WHITELIST_IPS=$(read_fakeip_whitelist_entries)
+
+    if hash nft 2>/dev/null; then
+        if nft list set inet clash fakeip_whitelist >/dev/null 2>&1; then
+            nft flush set inet clash fakeip_whitelist
+            if [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+                local nft_elements=$(echo "$FAKEIP_WHITELIST_IPS" | tr '\n' ',' | sed 's/,$//')
+                nft add element inet clash fakeip_whitelist "{ $nft_elements }"
+                msg "Updated nft fakeip_whitelist set: $(echo "$FAKEIP_WHITELIST_IPS" | wc -l | xargs) entries"
+            else
+                msg "Fakeip whitelist file is empty, nft set cleared"
+            fi
+        else
+            msg "WARNING: nft set inet clash fakeip_whitelist not found — is the clash-rules firewall active?"
+            return 1
+        fi
+    elif hash iptables 2>/dev/null; then
+        if hash ipset 2>/dev/null; then
+            ensure_fakeip_ipset && populate_fakeip_ipset_from_file
+        else
+            msg "ERROR: ipset not available for iptables fakeip whitelist update"
+            return 1
+        fi
+    else
+        msg "ERROR: Neither nftables nor iptables found"
+        return 1
+    fi
+
+    msg "Fakeip whitelist sets updated successfully"
+}
+
+# Add/replace the TUN device route in its policy routing table.
+# Called by init.d service_started() after the TUN interface is confirmed UP.
+# This must run after setup_routing_rules() has already added the ip rules.
+tun_route_setup() {
+    load_all_settings_once
+    case "$PROXY_MODE" in
+        "tun")
+            ip route replace default dev clash-tun table 100 2>/dev/null && \
+                msg "TUN route set: clash-tun → table 100 (TUN mode)" || \
+                msg "WARNING: Failed to set TUN route (clash-tun may not be up yet)"
+            ;;
+        "mixed")
+            ip route replace default dev clash-tun table 101 2>/dev/null && \
+                msg "TUN route set: clash-tun → table 101 (MIXED mode UDP)" || \
+                msg "WARNING: Failed to set TUN route (clash-tun may not be up yet)"
+            ;;
+        *)
+            msg "tun_route_setup: nothing to do for proxy mode '$PROXY_MODE'"
+            ;;
+    esac
+}
+
+# =============================================================================
+# SECTION: Entry points — start / stop / restart / update / update-ip-whitelist
+# =============================================================================
+
+start() {
+    msg "Starting Clash rules script"
+
+    # Check if config file exists before proceeding
+    if [ ! -f "$CONFIG_FILE" ]; then
+        msg "ERROR: Clash config file not found: $CONFIG_FILE"
+        return 1
+    fi
+
+    # Load all settings once from the file
+    load_all_settings_once
+
+    local server_ips fake_ip_config fake_ip_range fake_ip_filter_mode
+    server_ips=$(extract_server_ips)
+    fake_ip_config=$(extract_fake_ip_config)
+
+    # Parse the combined result
+    if [ -n "$fake_ip_config" ]; then
+        fake_ip_range="${fake_ip_config%|*}"
+        fake_ip_filter_mode="${fake_ip_config#*|}"
+    fi
+
+    # Expose filter mode globally so helper functions (apply_nft_marking_mangle etc.) can read it
+    FAKE_IP_FILTER_MODE="${fake_ip_filter_mode:-blacklist}"
+
+    # Pre-load fakeip whitelist IP-CIDR entries when in whitelist mode
+    if [ "$fake_ip_filter_mode" = "whitelist" ]; then
+        FAKEIP_WHITELIST_IPS=$(read_fakeip_whitelist_entries)
+        if [ -n "$FAKEIP_WHITELIST_IPS" ]; then
+            msg "Loaded fakeip whitelist: $(echo "$FAKEIP_WHITELIST_IPS" | wc -l | xargs) IP/CIDR entries from $FAKEIP_WHITELIST_FILE"
+        else
+            msg "Fakeip whitelist file is empty or not found at $FAKEIP_WHITELIST_FILE"
+        fi
+    fi
+
+    if [ -n "$server_ips" ]; then
+        msg "Extracted server IPs: $(echo "$server_ips" | tr '\n' ' ')"
+    else
+        msg "WARNING: No server IPs extracted from config"
+    fi
+
+    case "$PROXY_MODE" in
+        "tun")
+            msg "Proxy mode: TUN (all traffic routed via clash-tun, no TPROXY)"
+            ;;
+        "mixed")
+            msg "Proxy mode: MIXED (TCP via TPROXY port 7894, UDP via clash-tun/gVisor)"
+            ;;
+        *)
+            msg "Proxy mode: TPROXY (TCP+UDP via TPROXY port 7894)"
+            ;;
+    esac
+
+    if [ -n "$fake_ip_range" ]; then
+        if [ "$fake_ip_filter_mode" = "whitelist" ]; then
+            msg "Detected fake-ip range: $fake_ip_range with whitelist mode (most exclusion rules will be skipped) - proxy will be applied only to this range"
+        else
+            msg "Detected fake-ip range: $fake_ip_range with blacklist mode - proxy will be applied only to this range"
+        fi
+    else
+        msg "No fake-ip configuration detected - proxy will be applied to all traffic"
+    fi
+
+    if hash nft 2>/dev/null; then
+        msg "Using nftables for traffic redirection"
+        if apply_nft_rules "$server_ips" "$fake_ip_range" "$fake_ip_filter_mode"; then
+            setup_routing_rules
+        else
+            msg "ERROR: Failed to apply nftables rules"
+            return 1
+        fi
+    elif hash iptables 2>/dev/null; then
+        msg "Using iptables for traffic redirection"
+        if apply_iptables_rules "$server_ips" "$fake_ip_range" "$fake_ip_filter_mode"; then
+            setup_routing_rules
+        else
+            msg "ERROR: Failed to apply iptables rules"
+            return 1
+        fi
+    else
+        msg "ERROR: Neither nftables nor iptables found"
+        return 1
+    fi
+
+    msg "Clash rules script started successfully (proxy mode: $PROXY_MODE, interface mode: $MODE)"
+}
+
+stop() {
+    msg "Stopping Clash rules script"
+
+    load_all_settings_once
+
+    if hash nft 2>/dev/null; then
+        teardown_nft_tun_forward_rules
+        nft delete table inet clash 2>/dev/null
+        teardown_routing_rules
+        msg "nftables rules removed successfully"
+    elif hash iptables 2>/dev/null; then
+        teardown_iptables_tun_forward_rules
+        # Always attempt to remove QUIC rules unconditionally: if the setting was
+        # changed from "true" to "false" before restart, a conditional removal based
+        # on the current value would leave stale rules in the filter table.
+        iptables -t filter -D INPUT -p udp --dport 443 -j REJECT 2>/dev/null
+        iptables -t filter -D FORWARD -p udp --dport 443 -j REJECT 2>/dev/null
+        iptables -t mangle -D PREROUTING -j CLASH 2>/dev/null
+        iptables -t mangle -F CLASH 2>/dev/null
+        iptables -t mangle -X CLASH 2>/dev/null
+        iptables -t mangle -F CLASH_PROCESS 2>/dev/null
+        iptables -t mangle -X CLASH_PROCESS 2>/dev/null
+        iptables -t mangle -D OUTPUT -j CLASH_LOCAL 2>/dev/null
+        iptables -t mangle -F CLASH_LOCAL 2>/dev/null
+        iptables -t mangle -X CLASH_LOCAL 2>/dev/null
+        teardown_routing_rules
+        msg "iptables rules removed successfully"
+    else
+        msg "ERROR: Neither nftables nor iptables found"
+        return 1
+    fi
+
+    msg "Clash rules script stopped successfully (all routing rules cleaned up)"
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    update)
+        providers_exist=$(extract_proxy_providers)
+        if [ -z "$providers_exist" ]; then
+            msg "No proxy-providers configured, nothing to update."
+            exit 0
+        fi
+        update_rules
+        ;;
+    update-ip-whitelist)
+        update_fakeip_whitelist_sets
+        ;;
+    tun_route_setup)
+        tun_route_setup
+        ;;
+    tun_route_watch)
+        # Spawn a TUN route watcher daemon for the current proxy mode.
+        # Called on every procd (re)start so that the policy-routing table entry
+        # is restored even when Mihomo is respawned without a full clash-rules restart.
+        load_all_settings_once
+        case "$PROXY_MODE" in
+            "tun")   _spawn_tun_route_daemon 100 ;;
+            "mixed") _spawn_tun_route_daemon 101 ;;
+            *) msg "tun_route_watch: nothing to do for proxy mode '$PROXY_MODE'" ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|update|update-ip-whitelist|tun_route_setup|tun_route_watch}"
+        exit 1
+        ;;
+esac
