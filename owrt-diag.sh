@@ -3,7 +3,7 @@
 
 set -u
 
-SCRIPT_VERSION="0.4.0"
+SCRIPT_VERSION="0.4.1"
 
 # =========================
 # Default settings (editable)
@@ -93,7 +93,12 @@ detect_hostname() {
 
 fname() {
   # $1 = logical base name without extension
-  echo "${1}_${HOSTNAME_SHORT}.log"
+  mode_suffix=""
+  case "$MODE" in
+    *Clash_ON*) mode_suffix="_ClashON" ;;
+    *Clash_OFF*) mode_suffix="_ClashOFF" ;;
+  esac
+  echo "${1}_${HOSTNAME_SHORT}${mode_suffix}.txt"
 }
 
 say() {
@@ -341,9 +346,10 @@ detect_clash_state_raw() {
     parser_initd="$(parse_status_line "$first_initd")"
   fi
 
+  # pidof is safer than generic `ps|grep` here; grep can false-positive
+  # on script path/arguments (e.g. running from /opt/clash).
   pidof clash >/dev/null 2>&1 && proc_on=1
   pidof mihomo >/dev/null 2>&1 && proc_on=1
-  ps w 2>/dev/null | grep -Eq '[m]ihomo|[c]lash' && proc_on=1
 
   if command -v ss >/dev/null 2>&1; then
     ss -lntup 2>/dev/null | grep -Eq ':(7890|7891|7892|7893|7894)\b' && port_on=1
@@ -696,14 +702,14 @@ prepare_paths() {
   STATIC_DIR="$RAW_ROOT/00_static"
   mkdir -p "$STATIC_DIR" "$ANON_ROOT" "$META_DIR" || exit 2
 
-  MANIFEST_LOG="$META_DIR/90_manifest.log"
-  ERRORS_LOG="$META_DIR/91_errors.log"
-  RECO_LOG="$META_DIR/92_recommendations.log"
-  MATRIX_LOG="$META_DIR/93_collection_matrix.csv"
-  TOUCH_LOG="$META_DIR/94_ssclash_touchpoints.log"
-  EVENTS_LOG="$META_DIR/95_runtime_events.log"
-  SUMMARY_LOG="$META_DIR/96_summary.log"
-  RUN_LOG="$META_DIR/97_run_$(date +%Y%m%d-%H%M%S).log"
+  MANIFEST_LOG="$META_DIR/90_manifest.txt"
+  ERRORS_LOG="$META_DIR/91_errors.txt"
+  RECO_LOG="$META_DIR/92_recommendations.txt"
+  MATRIX_LOG="$META_DIR/93_collection_matrix.txt"
+  TOUCH_LOG="$META_DIR/94_ssclash_touchpoints.txt"
+  EVENTS_LOG="$META_DIR/95_runtime_events.txt"
+  SUMMARY_LOG="$META_DIR/96_summary.txt"
+  RUN_LOG="$META_DIR/97_run_$(date +%Y%m%d-%H%M%S).txt"
   ANON_MAP_FILE="$META_DIR/.anon_ipv4_map.tsv"
 
   touch "$MANIFEST_LOG" "$ERRORS_LOG" "$RECO_LOG" "$MATRIX_LOG" "$TOUCH_LOG" "$EVENTS_LOG" "$SUMMARY_LOG" "$RUN_LOG" "$ANON_MAP_FILE" || exit 2
@@ -735,7 +741,8 @@ manual_workflow() {
 auto_workflow() {
   initial="$(detect_clash_state)"
   initial_proc=0
-  ps w 2>/dev/null | grep -Eq '[m]ihomo|[c]lash' && initial_proc=1
+  pidof clash >/dev/null 2>&1 && initial_proc=1
+  pidof mihomo >/dev/null 2>&1 && initial_proc=1
   say "INFO" "AUTO start; initial clash state=$initial"
 
   if [ "$initial" = "on" ]; then
