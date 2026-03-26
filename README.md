@@ -26,10 +26,52 @@ All default runtime/anonymization knobs are grouped at the top of `owrt-diag.sh`
   │   ├─ 10_mode_Clash_OFF_untrusted/   # if auto state transition failed
   │   ├─ 11_mode_Clash_ON/
   │   ├─ 11_mode_Clash_ON_untrusted/    # if auto state transition failed
-  │   └─ 12_mode_Clash_ON_post/   # only in --auto when initial state is ON
+  │   └─ 12_mode_Clash_ON_post/         # only in --auto when initial state is ON
   ├─ anon/
   └─ meta/
 ```
+
+## Полная карта файлов репозитория
+
+### Основные скрипты
+
+- `owrt-diag.sh`  
+  Главный диагностический скрипт: сбор данных, режимы `--clash/--auto`, маскирование, мета-файлы, опциональное архивирование.
+
+- `clash-checker.sh`  
+  Отдельный прототип decision-логики определения состояния Clash (service/initd/process/ports).
+
+- `clash-status.sh`  
+  Вспомогательный probe-скрипт для проверки статус-парсинга и эвристик состояния Clash.
+
+- `test_script.sh`  
+  Лёгкий локальный playground для проверки `sanitize_hostname`, `parse_status_line` и live-проб.
+
+### Документация
+
+- `README.md` — быстрый старт, структура вывода, FAQ/How-to.
+- `docs/stage1_theoretical_analysis.md` — теоретический анализ проблемы.
+- `docs/stage2_architecture.md` — архитектура и поток выполнения.
+- `docs/stage3_data_inventory.md` — инвентаризация собираемых данных.
+- `docs/stage4_error_handling.md` — стратегия ошибок/деградации.
+- `docs/how_to_share_files.md` — как безопасно делиться результатами.
+- `docs/merge_conflicts_quick_guide.md` — краткий гайд по merge conflicts.
+- `docs/merge_playbook_pr_conflicts.md` — расширенный playbook по конфликтам.
+
+### Что появляется в output-сессии
+
+- `raw/` — исходные (немаскированные) данные.
+- `anon/` — маскированные данные (если не указан `--no-anon`).
+- `meta/` — служебные файлы запуска:
+  - `90_manifest.txt`
+  - `91_errors.txt`
+  - `92_recommendations.txt`
+  - `93_collection_matrix.txt`
+  - `94_ssclash_touchpoints.txt`
+  - `95_runtime_events.txt`
+  - `96_summary.txt`
+  - `97_run_<timestamp>.txt`
+  - `.anon_ipv4_map.tsv` (внутренняя таблица соответствий публичных IPv4)
 
 ## Usage
 
@@ -55,6 +97,12 @@ wget -O /tmp/owrt-diag.sh https://raw.githubusercontent.com/yuliantrip/openwrt-r
 
 # raw only
 ./owrt-diag.sh --no-anon
+
+# archive options
+./owrt-diag.sh --tar full
+./owrt-diag.sh --tar raw
+./owrt-diag.sh --tar anon
+./owrt-diag.sh --tar no
 ```
 
 ## Default parameters
@@ -73,7 +121,10 @@ Service wait/timeout defaults are configurable in script header:
 ## File naming
 
 - Session folder: `<timestamp>_<hostname>` (hostname auto-detected from `hostname` / `/proc/sys/kernel/hostname` / `uname -n` fallback).
-- Diagnostic files include hostname suffix, e.g. `01_system_baseline_<hostname>.log`.
+- Export files are `.txt`.
+- Runtime files in mode folders include mode suffix:
+  - `..._<hostname>_ClashON.txt`
+  - `..._<hostname>_ClashOFF.txt`
 
 ## About WARN lines in output
 
@@ -86,18 +137,56 @@ Some WARN entries are normal and expected depending on router setup:
 ## Anonymization policy (anon/)
 
 - Loopback IPv4 (`127.x.x.x`) is preserved.
-- Private/CGNAT ranges are rewritten to `55.55.<octet3>.<octet4>` (keeps relation, hides real subnet).
-- Public IPv4 are deterministically remapped into `198.18.x.y` (same source IP => same anonymized IP).
+- Private LAN by default is rewritten using `ANON_PRIVATE_PREFIX="192.168.55"` (prefix length adaptive).
+- Tailscale (`100.64.0.0/10`) by default is rewritten using `ANON_TAILSCALE_PREFIX="100.55"` (adaptive).
+- Public IPv4 are deterministically remapped into `ANON_PUBLIC_PREFIX` space (default `198.18`, adaptive by prefix length).
+- IPv6 subnet is masked while keeping host tail, format `[IPV6_MASKED]::<tail>`.
 - MAC addresses are partially masked: `XX:XX:XX:XX:<last2octets>`.
 - `option username`, `option password`, token/secret-like values are masked.
 
-## Metadata files
+## FAQ / How-to
 
-- `meta/90_manifest.log`
-- `meta/91_errors.log`
-- `meta/92_recommendations.log`
-- `meta/93_collection_matrix.csv`
-- `meta/94_ssclash_touchpoints.log`
-- `meta/95_runtime_events.log`
-- `meta/96_summary.log`
-- `meta/97_run_<timestamp>.log`
+### 1) Как запустить быстро и безопасно?
+
+```bash
+chmod +x owrt-diag.sh
+./owrt-diag.sh
+```
+
+По умолчанию скрипт read-only по сбору данных (кроме `--auto`, где выполняются `service clash stop/start` для сравнения состояний).
+
+### 2) Как получить сравнение OFF/ON автоматически?
+
+```bash
+./owrt-diag.sh --auto
+```
+
+Скрипт соберёт минимум `Clash_OFF` и `Clash_ON` (и `Clash_ON_post`, если стартовое состояние было ON), затем попробует восстановить исходное состояние сервиса.
+
+### 3) Что делать, если нужен только raw без маскировки?
+
+```bash
+./owrt-diag.sh --no-anon
+```
+
+### 4) Как управлять архивом результата?
+
+- Явно:
+  - `--tar full` (вся сессия),
+  - `--tar raw` (`raw+meta`),
+  - `--tar anon` (`anon+meta`),
+  - `--tar no` (не создавать архив).
+- Если `--tar` не задан, скрипт спросит в конце (в интерактивном TTY).
+
+### 5) Скрипт можно запускать из любой папки?
+
+Да. Текущая версия не должна зависеть от `cwd` для определения состояния `clash`.
+
+### 6) Какие WARN можно считать «нормальными»?
+
+- отсутствие `clash-tun`,
+- отсутствие `table 101`,
+- отсутствие `iptables`-compat на nft-only роутерах,
+- отсутствие отдельных ipset-сетов.
+
+Это не блокирует сбор и обычно отражает особенности конкретной конфигурации роутера.
